@@ -3,9 +3,9 @@ import requests
 import pandas as pd
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="MLB Engine V20 CLV Auto", layout="wide")
+st.set_page_config(page_title="MLB Engine V22 Multi-Market", layout="wide")
 
 API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 LOG_FILE = "bet_log.csv"
@@ -39,7 +39,7 @@ def get_odds():
     params = {
         "apiKey": API_KEY,
         "regions": "us,au",
-        "markets": "h2h",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "american"
     }
     return requests.get(url, params=params).json()
@@ -64,9 +64,39 @@ def get_team_strength():
 
     return teams
 
-# ------------------ MODEL ------------------ #
+# ------------------ PITCHER MODEL ------------------ #
 
-def predict(game, teams):
+def pitcher_era(name):
+    if not name:
+        return 4.5
+
+    try:
+        r = requests.get(
+            f"https://statsapi.mlb.com/api/v1/people/search?names={name}"
+        ).json()
+
+        people = r.get("people", [])
+        if not people:
+            return 4.5
+
+        pid = people[0]["id"]
+
+        s = requests.get(
+            f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season"
+        ).json()
+
+        splits = s.get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return 4.5
+
+        return float(splits[0]["stat"].get("era", 4.5))
+
+    except:
+        return 4.5
+
+# ------------------ 3 MARKET MODEL ------------------ #
+
+def model(game, teams):
 
     home = game["home_team"]
     away = game["away_team"]
@@ -78,103 +108,54 @@ def predict(game, teams):
     pitching = h.get("pitching", 4.3) - a.get("pitching", 4.3)
     bullpen = h.get("bullpen", 4.3) - a.get("bullpen", 4.3)
 
+    home_sp = pitcher_era(game.get("home_pitcher"))
+    away_sp = pitcher_era(game.get("away_pitcher"))
+
+    pitcher_edge = ((10 - home_sp) - (10 - away_sp)) / 2
+
     home_adv = 0.15
 
+    # ------------------ MONEYLINE ------------------ #
     ml_edge = (
-        0.40 * offense +
-        0.30 * pitching +
-        0.20 * bullpen +
-        0.10 * home_adv
+        0.35 * offense +
+        0.25 * pitching +
+        0.15 * bullpen +
+        0.20 * pitcher_edge +
+        0.05 * home_adv
     )
 
-    prob = sigmoid(ml_edge)
-    prob = clamp(prob, 0.05, 0.85)
+    win_prob = calibrate(sigmoid(ml_edge))
 
-    return calibrate(prob)
+    # ------------------ TOTALS ------------------ #
+    run_env = 8.6 + (offense * 1.8) - (pitching * 1.2)
 
-# ------------------ LOG SYSTEM ------------------ #
+    # pitcher adjustment affects scoring
+    run_env += (home_sp + away_sp - 9.0) * 0.15
 
-def load_log():
-    if os.path.exists(LOG_FILE):
-        return pd.read_csv(LOG_FILE)
-    return pd.DataFrame(columns=[
-        "id", "time", "game", "team",
-        "model_odds", "closing_odds", "clv", "last_updated"
-    ])
+    # ------------------ SPREAD ------------------ #
+    margin = ml_edge * 2.2
 
-def save_log(df):
-    df.to_csv(LOG_FILE, index=False)
+    return win_prob, run_env, margin, home_sp, away_sp
 
-def make_id(game, team):
-    return f"{game}_{team}".replace(" ", "_").lower()
+# ------------------ RAG ------------------ #
 
-# ------------------ UPDATE CLV (AUTO) ------------------ #
-
-def update_clv(df, odds_data):
-
-    for i, row in df.iterrows():
-
-        if pd.notnull(row["clv"]):
-            continue
-
-        game_name = row["game"]
-        team = row["team"]
-
-        home, away = game_name.split(" @ ")
-
-        match = next(
-            (g for g in odds_data
-             if g["home_team"] == home and g["away_team"] == away),
-            None
-        )
-
-        if not match:
-            continue
-
-        books = match.get("bookmakers", [])
-        if not books:
-            continue
-
-        try:
-            h2h = books[0]["markets"][0]
-
-            closing_price = next(
-                (o["price"] for o in h2h["outcomes"]
-                 if clean(o["name"]) == clean(team)),
-                None
-            )
-
-            if not closing_price:
-                continue
-
-            closing_odds = american_to_decimal(closing_price)
-            entry_odds = row["model_odds"]
-
-            clv = (closing_odds - entry_odds) / entry_odds
-
-            df.at[i, "closing_odds"] = closing_odds
-            df.at[i, "clv"] = clv
-            df.at[i, "last_updated"] = datetime.utcnow().isoformat()
-
-        except:
-            continue
-
-    return df
+def classify(ev_score):
+    if ev_score >= 0.05:
+        return "🟢 GREEN"
+    elif ev_score >= 0.01:
+        return "🟡 AMBER"
+    else:
+        return "🔴 RED"
 
 # ------------------ MAIN ------------------ #
 
-st.title("⚾ MLB Engine V20 — AUTO CLV SYSTEM")
+st.title("⚾ MLB Engine V22 — FULL MARKET SYSTEM")
 
 odds_data = get_odds()
 teams = get_team_strength()
 
-log = load_log()
-
-# 🔥 UPDATE OLD BETS WITH LATEST ODDS (REAL CLV)
-log = update_clv(log, odds_data)
-save_log(log)
-
 results = []
+log_rows = []
 
 for game in odds_data:
 
@@ -184,73 +165,83 @@ for game in odds_data:
     if not home or not away:
         continue
 
-    books = game.get("bookmakers", [])
-    if not books:
+    markets = game.get("bookmakers", [])
+    if not markets:
         continue
 
     try:
-        markets = books[0].get("markets", [])
-        h2h = next((m for m in markets if m["key"] == "h2h"), None)
-        if not h2h:
-            continue
+        h2h = markets[0]["markets"]
+        h2h = next(m for m in h2h if m["key"] == "h2h")
+        spread = next(m for m in markets[0]["markets"] if m["key"] == "spreads")
+        totals = next(m for m in markets[0]["markets"] if m["key"] == "totals")
 
-        def price(team):
-            return next(
-                (o["price"] for o in h2h["outcomes"]
-                 if clean(o["name"]) == clean(team)),
-                None
-            )
+        def price(market, team):
+            return next((o["price"] for o in market["outcomes"] if clean(o["name"]) == clean(team)), None)
 
-        home_price = price(home)
-        away_price = price(away)
+        home_ml = price(h2h, home)
+        away_ml = price(h2h, away)
 
-        if not home_price or not away_price:
+        if not home_ml or not away_ml:
             continue
 
     except:
         continue
 
-    prob = predict(game, teams)
+    prob, run_env, margin, home_sp, away_sp = model(game, teams)
 
-    home_odds = american_to_decimal(home_price)
-    away_odds = american_to_decimal(away_price)
+    # ------------------ MONEYLINE ------------------ #
+    home_ev = ev(prob, american_to_decimal(home_ml))
+    away_ev = ev(1 - prob, american_to_decimal(away_ml))
 
-    home_ev = ev(prob, home_odds)
-    away_ev = ev(1 - prob, away_odds)
+    ml_pick = home if home_ev > away_ev else away
+    ml_ev = max(home_ev, away_ev)
 
-    best = home if home_ev > away_ev else away
-    best_odds = home_odds if best == home else away_odds
+    # ------------------ TOTALS ------------------ #
+    total_line = 8.5
+    total_ev = ev(
+        1 if run_env > total_line else 0,
+        1.91
+    )
 
-    if max(home_ev, away_ev) < 0.02:
-        continue
+    total_pick = "OVER" if run_env > total_line else "UNDER"
 
-    game_id = make_id(f"{away} @ {home}", best)
+    # ------------------ SPREAD ------------------ #
+    spread_pick = home if margin > 1 else away
+    spread_ev = abs(margin) * 0.03
 
-    # avoid duplicate logging
-    if game_id not in log["id"].values:
-
-        log = pd.concat([log, pd.DataFrame([{
-            "id": game_id,
-            "time": datetime.utcnow().isoformat(),
-            "game": f"{away} @ {home}",
-            "team": best,
-            "model_odds": best_odds,
-            "closing_odds": None,
-            "clv": None,
-            "last_updated": None
-        }])], ignore_index=True)
+    # ------------------ RAG ------------------ #
+    ml_rating = classify(ml_ev)
+    total_rating = classify(total_ev)
+    spread_rating = classify(spread_ev)
 
     results.append({
         "Game": f"{away} @ {home}",
-        "Best Bet": best,
-        "Win %": round(prob * 100, 2),
-        "Odds": round(best_odds, 2)
+
+        # ML
+        "ML Pick": ml_pick,
+        "ML Rating": ml_rating,
+        "ML EV%": round(ml_ev * 100, 2),
+
+        # Totals
+        "Total Pick": total_pick,
+        "Total Rating": total_rating,
+        "Total EV%": round(total_ev * 100, 2),
+
+        # Spread
+        "Spread Pick": spread_pick,
+        "Spread Rating": spread_rating,
+        "Spread EV%": round(spread_ev * 100, 2),
+
+        # Pitchers
+        "Home SP ERA": home_sp,
+        "Away SP ERA": away_sp,
+        "Projected Runs": round(run_env, 2)
     })
 
-save_log(log)
+# ------------------ OUTPUT ------------------ #
 
-st.subheader("📊 Today's Bets")
-st.dataframe(pd.DataFrame(results), use_container_width=True)
+df = pd.DataFrame(results)
 
-st.subheader("📈 CLV Performance (LIVE UPDATING)")
-st.dataframe(log.sort_values("time", ascending=False).head(50), use_container_width=True)
+st.subheader("📊 Full Market Recommendations")
+
+st.dataframe(df.sort_values("ML EV%", ascending=False), use_container_width=True)
