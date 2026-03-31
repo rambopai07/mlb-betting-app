@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import pandas as pd
-import uuid
 import math
 from datetime import datetime
 
@@ -11,11 +10,11 @@ st.set_page_config(layout="wide")
 # HEADER
 # -----------------------------
 today = datetime.now().strftime("%A %d %B %Y")
-st.title("⚾ MLB Betting Engine v5 (Clean Logic Fix)")
+st.title("⚾ MLB Betting Engine v6 (Fixed UX + Bets)")
 st.subheader(f"📅 Slate: {today}")
 
 # -----------------------------
-# TRACKER
+# SESSION STATE
 # -----------------------------
 if "bets" not in st.session_state:
     st.session_state.bets = []
@@ -50,35 +49,17 @@ def get_mlb_schedule():
 games = get_mlb_schedule()
 
 # -----------------------------
-# LIVE TEAM STRENGTH (MLB API BASED)
+# LIVE TEAM STRENGTH (simplified stable version)
 # -----------------------------
-def get_team_strengths():
-    url = "https://statsapi.mlb.com/api/v1/stats?stats=season&group=hitting&sportId=1"
-    data = requests.get(url).json()
-
-    teams = {}
-    stats = data.get("stats", [])[0].get("splits", [])
-
-    for t in stats:
-        name = t["team"]["name"]
-
-        ops = float(t["stat"].get("ops", 0))
-        runs = float(t["stat"].get("runs", 0))
-        avg = float(t["stat"].get("avg", 0))
-
-        score = (ops * 100) + (runs / 10) + (avg * 1000)
-        teams[name] = score
-
-    if not teams:
-        return {}
-
-    mx = max(teams.values())
-    for k in teams:
-        teams[k] /= mx
-
-    return teams
-
-TEAM = get_team_strengths()
+def team_strength(team):
+    # lightweight proxy (stable, no API dependency failure risk)
+    base = {
+        "Dodgers": 1.25, "Yankees": 1.18, "Braves": 1.22, "Astros": 1.15,
+        "Phillies": 1.10, "Orioles": 1.08, "Rangers": 1.07,
+        "Mets": 1.02, "Mariners": 1.03, "Guardians": 1.00,
+        "Red Sox": 0.99, "Cubs": 1.01, "Padres": 1.04
+    }
+    return base.get(team, 0.98)
 
 # -----------------------------
 # PITCHER IMPACT
@@ -92,26 +73,23 @@ def pitcher_strength(name):
 
     for p in elite:
         if p in name:
-            return 0.35
+            return 0.25
     for p in good:
         if p in name:
-            return 0.15
+            return 0.10
 
-    return 0.05
+    return 0.03
 
 # -----------------------------
-# CORE MODELS
+# MODELS
 # -----------------------------
-def team_strength(name):
-    return TEAM.get(name, 0.5)
-
 def win_prob(home, away, hp, ap):
-    h = team_strength(home) + pitcher_strength(hp) + 0.03
+    h = team_strength(home) + pitcher_strength(hp) + 0.02
     a = team_strength(away) + pitcher_strength(ap)
 
     diff = (h - a)
 
-    return 1 / (1 + math.exp(-diff * 8))
+    return 1 / (1 + math.exp(-diff * 7))
 
 def expected_runs(team, opp_pitch):
     base = team_strength(team)
@@ -129,7 +107,7 @@ def spread_model(home, away, hp, ap):
     return round(expected_runs(home, ap) - expected_runs(away, hp), 2)
 
 # -----------------------------
-# EDGE CALCULATION
+# EDGE + GRADING
 # -----------------------------
 def ml_edge(p):
     return round((p - 0.5) * 100, 2)
@@ -140,22 +118,25 @@ def total_edge(t):
 def spread_edge(s):
     return round(s * 10, 2)
 
-# -----------------------------
-# CLEAN GRADING (FIXED)
-# -----------------------------
-def grade(edge):
-    if edge <= 0:
+def grade(e):
+    if e <= 0:
         return "NO BET"
-    elif edge >= 5:
+    if e >= 5:
         return "STRONG BET"
-    elif edge >= 2:
+    if e >= 2:
         return "LEAN"
     return "NO BET"
 
 # -----------------------------
-# DISPLAY
+# PICK LOGIC (IMPORTANT FIX)
 # -----------------------------
-st.header("📊 Full Slate")
+def ml_pick(home, away, prob_home):
+    return home if prob_home > 0.5 else away
+
+# -----------------------------
+# UI
+# -----------------------------
+st.header("📊 Full MLB Slate")
 
 for home, away, hp, ap in games:
 
@@ -165,12 +146,16 @@ for home, away, hp, ap in games:
     col1, col2, col3 = st.columns(3)
 
     p = win_prob(home, away, hp, ap)
+
     total, hr, ar = totals_model(home, away, hp, ap)
+
     spread = spread_model(home, away, hp, ap)
 
     ml_e = ml_edge(p)
     t_e = total_edge(total)
     s_e = spread_edge(spread)
+
+    pick = ml_pick(home, away, p)
 
     with col1:
         st.write("🏟️ Pitchers")
@@ -178,30 +163,38 @@ for home, away, hp, ap in games:
         st.write(f"Home: {hp}")
 
         st.write("📈 Moneyline")
-        st.write(f"{round(p*100,2)}%")
+        st.write(f"Win Prob: {round(p*100,2)}%")
+        st.write(f"👉 PICK: {pick} ML")
         st.write(f"Edge: {ml_e}% {grade(ml_e)}")
 
     with col2:
         st.write("⚾ Totals")
-        st.write(f"{total}")
+        st.write(f"Projected: {total}")
         st.write(f"{home}: {hr}")
         st.write(f"{away}: {ar}")
         st.write(f"Edge: {t_e}% {grade(t_e)}")
 
     with col3:
         st.write("📊 Spread")
-        st.write(f"{spread}")
+        st.write(f"Run Diff: {spread}")
         st.write(f"Edge: {s_e}% {grade(s_e)}")
 
-    # BET TRACKER
-    if st.button(f"➕ Add Bet {away} @ {home}", key=str(uuid.uuid4())):
+    # -----------------------------
+    # BET TRACKER (FIXED KEY)
+    # -----------------------------
+    if st.button(f"➕ Add Bet {away} @ {home}", key=f"{away}_vs_{home}"):
+
         st.session_state.bets.append({
             "game": f"{away} @ {home}",
+            "pick": pick,
+            "ml_prob": round(p, 3),
             "ml_edge": ml_e,
             "total_edge": t_e,
             "spread_edge": s_e,
             "status": "open"
         })
+
+        st.success(f"Added bet: {pick} ML")
 
 # -----------------------------
 # TRACKER
@@ -211,4 +204,4 @@ st.header("📒 Bet Tracker")
 if st.session_state.bets:
     st.dataframe(pd.DataFrame(st.session_state.bets))
 else:
-    st.info("No bets yet.")
+    st.info("No bets added yet.")
