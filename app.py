@@ -6,22 +6,22 @@ from datetime import datetime
 
 st.set_page_config(layout="wide")
 
-# -----------------------------
+# =========================
 # HEADER
-# -----------------------------
+# =========================
 today = datetime.now().strftime("%A %d %B %Y")
-st.title("⚾ MLB Betting Engine v6 (Fixed UX + Bets)")
+st.title("⚾ MLB Betting Engine v7 (Pitcher + Weather Model)")
 st.subheader(f"📅 Slate: {today}")
 
-# -----------------------------
-# SESSION STATE
-# -----------------------------
+# =========================
+# STATE
+# =========================
 if "bets" not in st.session_state:
     st.session_state.bets = []
 
-# -----------------------------
+# =========================
 # MLB SCHEDULE
-# -----------------------------
+# =========================
 def get_mlb_schedule():
     url = (
         "https://statsapi.mlb.com/api/v1/schedule"
@@ -48,67 +48,128 @@ def get_mlb_schedule():
 
 games = get_mlb_schedule()
 
-# -----------------------------
-# LIVE TEAM STRENGTH (simplified stable version)
-# -----------------------------
+# =========================
+# PITCHER STATS (MLB API)
+# =========================
+PITCHER_CACHE = {}
+
+def get_pitcher_stats(name):
+
+    if name in PITCHER_CACHE:
+        return PITCHER_CACHE[name]
+
+    try:
+        search = requests.get(
+            f"https://statsapi.mlb.com/api/v1/people/search?names={name}"
+        ).json()
+
+        person = search["people"][0]
+        pid = person["id"]
+
+        stats = requests.get(
+            f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=pitching"
+        ).json()
+
+        s = stats["stats"][0]["splits"][0]["stat"]
+
+        data = {
+            "era": float(s.get("era", 4.5)),
+            "whip": float(s.get("whip", 1.3)),
+            "k9": float(s.get("strikeoutsPer9Inn", 8.0)),
+            "bb9": float(s.get("baseOnBallsPer9Inn", 3.0)),
+            "ip": float(s.get("inningsPitched", 100))
+        }
+
+    except:
+        data = {
+            "era": 4.5,
+            "whip": 1.3,
+            "k9": 8.0,
+            "bb9": 3.0,
+            "ip": 100
+        }
+
+    PITCHER_CACHE[name] = data
+    return data
+
+# =========================
+# PITCHER RATING
+# =========================
+def pitcher_rating(p):
+
+    return (
+        (4.5 - p["era"]) * 0.40 +
+        (1.3 - p["whip"]) * 0.35 +
+        (p["k9"] - 8) * 0.05 -
+        (p["bb9"] - 3) * 0.06 +
+        (p["ip"] / 200) * 0.2
+    )
+
+# =========================
+# WEATHER MODEL
+# =========================
+def weather_factor(temp=75, wind=5):
+    return (temp - 70) * 0.01 + wind * 0.02
+
+# =========================
+# TEAM STRENGTH MODEL
+# =========================
 def team_strength(team):
-    # lightweight proxy (stable, no API dependency failure risk)
+
     base = {
-        "Dodgers": 1.25, "Yankees": 1.18, "Braves": 1.22, "Astros": 1.15,
-        "Phillies": 1.10, "Orioles": 1.08, "Rangers": 1.07,
-        "Mets": 1.02, "Mariners": 1.03, "Guardians": 1.00,
-        "Red Sox": 0.99, "Cubs": 1.01, "Padres": 1.04
+        "Dodgers": 0.15, "Yankees": 0.12, "Braves": 0.14, "Astros": 0.10,
+        "Phillies": 0.08, "Orioles": 0.09, "Rangers": 0.07,
+        "Mets": 0.03, "Mariners": 0.04, "Guardians": 0.02,
+        "Red Sox": 0.02, "Cubs": 0.03, "Padres": 0.05
     }
-    return base.get(team, 0.98)
 
-# -----------------------------
-# PITCHER IMPACT
-# -----------------------------
-def pitcher_strength(name):
-    if name == "TBD":
-        return 0
+    return base.get(team, 0.00)
 
-    elite = ["Cole", "Strider", "Burnes", "Skubal", "Wheeler", "Valdez"]
-    good = ["Gausman", "Gray", "Rodon", "Lugo", "Taillon", "Pivetta"]
-
-    for p in elite:
-        if p in name:
-            return 0.25
-    for p in good:
-        if p in name:
-            return 0.10
-
-    return 0.03
-
-# -----------------------------
-# MODELS
-# -----------------------------
+# =========================
+# WIN PROBABILITY
+# =========================
 def win_prob(home, away, hp, ap):
-    h = team_strength(home) + pitcher_strength(hp) + 0.02
-    a = team_strength(away) + pitcher_strength(ap)
 
-    diff = (h - a)
+    h_pitch = pitcher_rating(get_pitcher_stats(hp))
+    a_pitch = pitcher_rating(get_pitcher_stats(ap))
 
-    return 1 / (1 + math.exp(-diff * 7))
+    h = team_strength(home) + h_pitch + 0.05
+    a = team_strength(away) + a_pitch
 
-def expected_runs(team, opp_pitch):
-    base = team_strength(team)
-    pitch = pitcher_strength(opp_pitch)
+    diff = h - a
 
-    return max(2.0, min(6.5, 4.5 * base * (1 - pitch)))
+    return 1 / (1 + math.exp(-diff * 5))
 
-def totals_model(home, away, hp, ap):
-    hr = expected_runs(home, ap)
-    ar = expected_runs(away, hp)
+# =========================
+# RUN MODEL
+# =========================
+def expected_runs(team, pitcher, weather=0):
+
+    p = pitcher_rating(get_pitcher_stats(pitcher))
+
+    base = 4.3 + team_strength(team)
+
+    return max(2.0, min(7.5, base - p + weather))
+
+def totals_model(home, away, hp, ap, temp=75, wind=5):
+
+    w = weather_factor(temp, wind)
+
+    hr = expected_runs(home, ap, w)
+    ar = expected_runs(away, hp, w)
 
     return round(hr + ar, 2), round(hr, 2), round(ar, 2)
 
+# =========================
+# SPREAD MODEL
+# =========================
 def spread_model(home, away, hp, ap):
+
     return round(expected_runs(home, ap) - expected_runs(away, hp), 2)
 
-# -----------------------------
+# =========================
 # EDGE + GRADING
-# -----------------------------
+# =========================
 def ml_edge(p):
     return round((p - 0.5) * 100, 2)
 
@@ -127,15 +188,15 @@ def grade(e):
         return "LEAN"
     return "NO BET"
 
-# -----------------------------
-# PICK LOGIC (IMPORTANT FIX)
-# -----------------------------
-def ml_pick(home, away, prob_home):
-    return home if prob_home > 0.5 else away
+# =========================
+# PICK LOGIC
+# =========================
+def ml_pick(home, away, p):
+    return home if p > 0.5 else away
 
-# -----------------------------
+# =========================
 # UI
-# -----------------------------
+# =========================
 st.header("📊 Full MLB Slate")
 
 for home, away, hp, ap in games:
@@ -179,9 +240,9 @@ for home, away, hp, ap in games:
         st.write(f"Run Diff: {spread}")
         st.write(f"Edge: {s_e}% {grade(s_e)}")
 
-    # -----------------------------
-    # BET TRACKER (FIXED KEY)
-    # -----------------------------
+    # =========================
+    # BET TRACKER
+    # =========================
     if st.button(f"➕ Add Bet {away} @ {home}", key=f"{away}_vs_{home}"):
 
         st.session_state.bets.append({
@@ -194,11 +255,11 @@ for home, away, hp, ap in games:
             "status": "open"
         })
 
-        st.success(f"Added bet: {pick} ML")
+        st.success(f"Added: {pick} ML")
 
-# -----------------------------
+# =========================
 # TRACKER
-# -----------------------------
+# =========================
 st.header("📒 Bet Tracker")
 
 if st.session_state.bets:
