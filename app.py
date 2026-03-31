@@ -10,19 +10,20 @@ st.set_page_config(layout="wide")
 # HEADER
 # =========================
 today = datetime.now().strftime("%A %d %B %Y")
-st.title("⚾ MLB Betting Engine v7 (Pitcher + Weather Model)")
+st.title("⚾ MLB Betting Engine V8 (Fixed Pitcher ID Model)")
 st.subheader(f"📅 Slate: {today}")
 
 # =========================
-# STATE
+# SESSION STATE
 # =========================
 if "bets" not in st.session_state:
     st.session_state.bets = []
 
 # =========================
-# MLB SCHEDULE
+# MLB SCHEDULE (WITH PITCHER IDS)
 # =========================
 def get_mlb_schedule():
+
     url = (
         "https://statsapi.mlb.com/api/v1/schedule"
         "?sportId=1"
@@ -36,43 +37,66 @@ def get_mlb_schedule():
     for d in data.get("dates", []):
         for g in d.get("games", []):
 
-            home = g["teams"]["home"]["team"]["name"]
-            away = g["teams"]["away"]["team"]["name"]
+            home_team = g["teams"]["home"]["team"]["name"]
+            away_team = g["teams"]["away"]["team"]["name"]
 
-            home_pitcher = g["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-            away_pitcher = g["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
+            home_pitcher = g["teams"]["home"].get("probablePitcher")
+            away_pitcher = g["teams"]["away"].get("probablePitcher")
 
-            games.append((home, away, home_pitcher, away_pitcher))
+            home_pid = home_pitcher["id"] if home_pitcher else None
+            away_pid = away_pitcher["id"] if away_pitcher else None
+
+            home_pname = home_pitcher["fullName"] if home_pitcher else "TBD"
+            away_pname = away_pitcher["fullName"] if away_pitcher else "TBD"
+
+            games.append({
+                "home": home_team,
+                "away": away_team,
+                "home_pid": home_pid,
+                "away_pid": away_pid,
+                "home_pname": home_pname,
+                "away_pname": away_pname
+            })
 
     return games
 
 games = get_mlb_schedule()
 
 # =========================
-# PITCHER STATS (MLB API)
+# TEAM STRENGTH (expanded variance)
+# =========================
+def team_strength(team):
+
+    base = {
+        "Dodgers": 0.16, "Yankees": 0.13, "Braves": 0.15, "Astros": 0.11,
+        "Phillies": 0.09, "Orioles": 0.10, "Rangers": 0.08,
+        "Mets": 0.04, "Mariners": 0.05, "Guardians": 0.03,
+        "Red Sox": 0.03, "Cubs": 0.04, "Padres": 0.06
+    }
+
+    return base.get(team, 0.0)
+
+# =========================
+# PITCHER STATS (BY ID — FIXED)
 # =========================
 PITCHER_CACHE = {}
 
-def get_pitcher_stats(name):
+def get_pitcher_stats(pid):
 
-    if name in PITCHER_CACHE:
-        return PITCHER_CACHE[name]
+    if pid in PITCHER_CACHE:
+        return PITCHER_CACHE[pid]
 
     try:
-        search = requests.get(
-            f"https://statsapi.mlb.com/api/v1/people/search?names={name}"
-        ).json()
+        url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
 
-        person = search["people"][0]
-        pid = person["id"]
+        data = requests.get(url, params={
+            "stats": "season",
+            "group": "pitching"
+        }).json()
 
-        stats = requests.get(
-            f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=pitching"
-        ).json()
+        s = data["stats"][0]["splits"][0]["stat"]
 
-        s = stats["stats"][0]["splits"][0]["stat"]
-
-        data = {
+        stats = {
             "era": float(s.get("era", 4.5)),
             "whip": float(s.get("whip", 1.3)),
             "k9": float(s.get("strikeoutsPer9Inn", 8.0)),
@@ -81,103 +105,68 @@ def get_pitcher_stats(name):
         }
 
     except:
-        data = {
-            "era": 4.5,
-            "whip": 1.3,
-            "k9": 8.0,
-            "bb9": 3.0,
-            "ip": 100
-        }
+        stats = None
 
-    PITCHER_CACHE[name] = data
-    return data
+    PITCHER_CACHE[pid] = stats
+    return stats
 
 # =========================
 # PITCHER RATING
 # =========================
-def pitcher_rating(p):
+def pitcher_rating(stats):
+
+    if not stats:
+        return 0
 
     return (
-        (4.5 - p["era"]) * 0.40 +
-        (1.3 - p["whip"]) * 0.35 +
-        (p["k9"] - 8) * 0.05 -
-        (p["bb9"] - 3) * 0.06 +
-        (p["ip"] / 200) * 0.2
+        (4.5 - stats["era"]) * 0.45 +
+        (1.3 - stats["whip"]) * 0.35 +
+        (stats["k9"] - 8) * 0.06 -
+        (stats["bb9"] - 3) * 0.07 +
+        (stats["ip"] / 200) * 0.2
     )
-
-# =========================
-# WEATHER MODEL
-# =========================
-def weather_factor(temp=75, wind=5):
-    return (temp - 70) * 0.01 + wind * 0.02
-
-# =========================
-# TEAM STRENGTH MODEL
-# =========================
-def team_strength(team):
-
-    base = {
-        "Dodgers": 0.15, "Yankees": 0.12, "Braves": 0.14, "Astros": 0.10,
-        "Phillies": 0.08, "Orioles": 0.09, "Rangers": 0.07,
-        "Mets": 0.03, "Mariners": 0.04, "Guardians": 0.02,
-        "Red Sox": 0.02, "Cubs": 0.03, "Padres": 0.05
-    }
-
-    return base.get(team, 0.00)
 
 # =========================
 # WIN PROBABILITY
 # =========================
-def win_prob(home, away, hp, ap):
+def win_prob(home, away):
 
-    h_pitch = pitcher_rating(get_pitcher_stats(hp))
-    a_pitch = pitcher_rating(get_pitcher_stats(ap))
+    h_pitch = pitcher_rating(get_pitcher_stats(home["home_pid"]))
+    a_pitch = pitcher_rating(get_pitcher_stats(away["away_pid"]))
 
-    h = team_strength(home) + h_pitch + 0.05
-    a = team_strength(away) + a_pitch
+    h = team_strength(home["home"]) + h_pitch + 0.05
+    a = team_strength(away["away"]) + a_pitch
 
     diff = h - a
 
-    return 1 / (1 + math.exp(-diff * 5))
+    return 1 / (1 + math.exp(-diff * 6))
 
 # =========================
 # RUN MODEL
 # =========================
-def expected_runs(team, pitcher, weather=0):
+def expected_runs(team, pid):
 
-    p = pitcher_rating(get_pitcher_stats(pitcher))
+    p = pitcher_rating(get_pitcher_stats(pid))
 
     base = 4.3 + team_strength(team)
 
-    return max(2.0, min(7.5, base - p + weather))
+    return max(2.0, min(7.8, base - p))
 
-def totals_model(home, away, hp, ap, temp=75, wind=5):
+def totals_model(home, away):
 
-    w = weather_factor(temp, wind)
-
-    hr = expected_runs(home, ap, w)
-    ar = expected_runs(away, hp, w)
+    hr = expected_runs(home["home"], away["away_pid"])
+    ar = expected_runs(away["away"], home["home_pid"])
 
     return round(hr + ar, 2), round(hr, 2), round(ar, 2)
 
 # =========================
-# SPREAD MODEL
-# =========================
-def spread_model(home, away, hp, ap):
-
-    return round(expected_runs(home, ap) - expected_runs(away, hp), 2)
-
-# =========================
-# EDGE + GRADING
+# EDGE
 # =========================
 def ml_edge(p):
     return round((p - 0.5) * 100, 2)
 
 def total_edge(t):
     return round((t - 8.5) * 5, 2)
-
-def spread_edge(s):
-    return round(s * 10, 2)
 
 def grade(e):
     if e <= 0:
@@ -189,73 +178,65 @@ def grade(e):
     return "NO BET"
 
 # =========================
-# PICK LOGIC
+# PICK
 # =========================
-def ml_pick(home, away, p):
-    return home if p > 0.5 else away
+def pick(game, p):
+
+    return game["home"] if p > 0.5 else game["away"]
 
 # =========================
 # UI
 # =========================
-st.header("📊 Full MLB Slate")
+st.header("📊 MLB Slate")
 
-for home, away, hp, ap in games:
+for g in games:
 
     st.markdown("---")
-    st.subheader(f"{away} @ {home}")
+    st.subheader(f"{g['away']} @ {g['home']}")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
 
-    p = win_prob(home, away, hp, ap)
+    p = win_prob(g, g)
 
-    total, hr, ar = totals_model(home, away, hp, ap)
-
-    spread = spread_model(home, away, hp, ap)
+    total, hr, ar = totals_model(g, g)
 
     ml_e = ml_edge(p)
     t_e = total_edge(total)
-    s_e = spread_edge(spread)
 
-    pick = ml_pick(home, away, p)
+    bet_pick = pick(g, p)
 
     with col1:
         st.write("🏟️ Pitchers")
-        st.write(f"Away: {ap}")
-        st.write(f"Home: {hp}")
+        st.write(f"Away: {g['away_pname']}")
+        st.write(f"Home: {g['home_pname']}")
 
         st.write("📈 Moneyline")
         st.write(f"Win Prob: {round(p*100,2)}%")
-        st.write(f"👉 PICK: {pick} ML")
+        st.write(f"👉 PICK: {bet_pick}")
         st.write(f"Edge: {ml_e}% {grade(ml_e)}")
 
     with col2:
         st.write("⚾ Totals")
         st.write(f"Projected: {total}")
-        st.write(f"{home}: {hr}")
-        st.write(f"{away}: {ar}")
+        st.write(f"{g['home']}: {hr}")
+        st.write(f"{g['away']}: {ar}")
         st.write(f"Edge: {t_e}% {grade(t_e)}")
-
-    with col3:
-        st.write("📊 Spread")
-        st.write(f"Run Diff: {spread}")
-        st.write(f"Edge: {s_e}% {grade(s_e)}")
 
     # =========================
     # BET TRACKER
     # =========================
-    if st.button(f"➕ Add Bet {away} @ {home}", key=f"{away}_vs_{home}"):
+    if st.button(f"➕ Add Bet {g['away']} @ {g['home']}", key=f"{g['away']}_{g['home']}"):
 
         st.session_state.bets.append({
-            "game": f"{away} @ {home}",
-            "pick": pick,
+            "game": f"{g['away']} @ {g['home']}",
+            "pick": bet_pick,
             "ml_prob": round(p, 3),
             "ml_edge": ml_e,
             "total_edge": t_e,
-            "spread_edge": s_e,
             "status": "open"
         })
 
-        st.success(f"Added: {pick} ML")
+        st.success("Bet added!")
 
 # =========================
 # TRACKER
@@ -265,4 +246,4 @@ st.header("📒 Bet Tracker")
 if st.session_state.bets:
     st.dataframe(pd.DataFrame(st.session_state.bets))
 else:
-    st.info("No bets added yet.")
+    st.info("No bets yet")
