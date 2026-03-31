@@ -6,8 +6,7 @@ from datetime import datetime
 
 st.set_page_config(layout="wide")
 
-st.title("⚾ MLB Betting Engine V11.1 (Full Model + Tracker)")
-
+st.title("⚾ MLB Betting Engine V11.2 (Scaled Model Fix)")
 st.subheader(datetime.now().strftime("%A %d %B %Y"))
 
 # =========================
@@ -27,7 +26,6 @@ def get_games():
 
     for d in data.get("dates", []):
         for g in d.get("games", []):
-
             games.append({
                 "home": g["teams"]["home"]["team"]["name"],
                 "away": g["teams"]["away"]["team"]["name"],
@@ -37,46 +35,26 @@ def get_games():
 
     return games
 
-games = get_games()
-
 # =========================
-# OFFENSE (proxy but stable)
+# TEAM FACTORS
 # =========================
 def offense(team):
     base = {
         "Dodgers": 0.18, "Braves": 0.17, "Yankees": 0.15,
         "Astros": 0.14, "Phillies": 0.13, "Orioles": 0.13,
-        "Mets": 0.09, "Mariners": 0.10, "Guardians": 0.08,
-        "Red Sox": 0.11, "Cubs": 0.10
+        "Mets": 0.09, "Mariners": 0.10, "Guardians": 0.08
     }
     return base.get(team, 0.10)
 
-# =========================
-# DEFENSE
-# =========================
 def defense(team):
-    base = {
-        "Dodgers": 0.12, "Braves": 0.11, "Yankees": 0.10,
-        "Astros": 0.11, "Phillies": 0.10, "Orioles": 0.11
-    }
-    return base.get(team, 0.08)
+    return 0.10
 
-# =========================
-# BULLPEN
-# =========================
 def bullpen(team):
-    base = {
-        "Dodgers": 0.08, "Braves": 0.07, "Yankees": 0.06,
-        "Astros": 0.06, "Phillies": 0.05, "Orioles": 0.06
-    }
-    return base.get(team, 0.04)
+    return 0.06
 
-# =========================
-# PARK FACTOR
-# =========================
 def park_factor(team):
-    hitter = ["Yankees", "Red Sox", "Cubs", "Rangers"]
-    pitcher = ["Dodgers", "Mets", "Mariners"]
+    hitter = ["Yankees", "Red Sox", "Cubs"]
+    pitcher = ["Dodgers", "Mariners"]
 
     if team in hitter:
         return 0.02
@@ -85,7 +63,7 @@ def park_factor(team):
     return 0
 
 # =========================
-# PITCHER MODEL (REAL MLB API)
+# PITCHER MODEL
 # =========================
 def pitcher_rating(p):
 
@@ -96,11 +74,7 @@ def pitcher_rating(p):
         pid = p.get("id")
 
         url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
-
-        data = requests.get(url, params={
-            "stats": "season",
-            "group": "pitching"
-        }).json()
+        data = requests.get(url, params={"stats": "season", "group": "pitching"}).json()
 
         s = data["stats"][0]["splits"][0]["stat"]
 
@@ -122,25 +96,22 @@ def pitcher_rating(p):
     )
 
 # =========================
-# TEAM STRENGTH (FULL MODEL)
+# TEAM STRENGTH (FIXED SCALE)
 # =========================
 def team_strength(team, pitcher, is_home):
 
-    val = (
-        offense(team) +
-        defense(team) +
-        bullpen(team) +
-        pitcher_rating(pitcher) +
-        park_factor(team)
-    )
+    off = offense(team) * 100
+    defn = defense(team) * 60
+    bull = bullpen(team) * 40
+    park = park_factor(team) * 100
+    pitch = pitcher_rating(pitcher) * 120
 
-    if is_home:
-        val += 0.03
+    home = 2.5 if is_home else 0
 
-    return val
+    return off - defn - bull + pitch + park + home
 
 # =========================
-# WIN PROBABILITY
+# WIN PROBABILITY (FIXED)
 # =========================
 def win_prob(home, away, hp, ap):
 
@@ -149,28 +120,23 @@ def win_prob(home, away, hp, ap):
 
     diff = h - a
 
-    return 1 / (1 + math.exp(-diff * 6))
+    return 1 / (1 + math.exp(-diff / 18))
 
 # =========================
-# RUN MODEL (TOTALS)
+# RUN MODEL (FIXED)
 # =========================
 def expected_runs(team, pitcher):
 
-    base = 4.3 + offense(team) - pitcher_rating(pitcher) + park_factor(team)
+    base_runs = 4.3
 
-    return max(2.0, min(8.5, base))
+    off = offense(team) * 5
+    pitch = pitcher_rating(pitcher) * 6
+
+    return max(2.0, min(8.5, base_runs + off - pitch + (park_factor(team) * 2)))
 
 # =========================
-# ODDS / EV
+# EV + GRADING
 # =========================
-def american_to_prob(o):
-    if o < 0:
-        return (-o) / (-o + 100)
-    return 100 / (o + 100)
-
-def ev(model_p, odds):
-    return (model_p - american_to_prob(odds)) * 100
-
 def grade(e):
     if e >= 5:
         return "🟢 STRONG BET"
@@ -193,9 +159,7 @@ for g in games:
     hp = g["home_pitcher"]
     ap = g["away_pitcher"]
 
-    # =====================
-    # CORE MODEL
-    # =====================
+    # MODEL
     p_home = win_prob(home, away, hp, ap)
 
     home_runs = expected_runs(home, ap)
@@ -204,21 +168,15 @@ for g in games:
     total = home_runs + away_runs
     spread = home_runs - away_runs
 
-    # =====================
-    # MONEYLINE
-    # =====================
-    ev_ml = ev(p_home, -110)
+    # ML
+    ev_ml = (p_home - 0.52) * 100
     ml_pick = home if p_home > 0.5 else away
 
-    # =====================
     # TOTALS
-    # =====================
     ev_tot = (total - 8.5) * 7
     tot_pick = "OVER" if total > 8.5 else "UNDER"
 
-    # =====================
     # SPREAD
-    # =====================
     ev_spread = spread * 6
     spread_pick = home if spread > 0 else away
 
@@ -228,33 +186,28 @@ for g in games:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.write("🏟️ Pitchers")
+        st.write("Pitchers")
         st.write(f"Away: {ap.get('fullName','TBD')}")
         st.write(f"Home: {hp.get('fullName','TBD')}")
 
     with c2:
-        st.write("📈 MONEYLINE")
-        st.write(f"Pick: {ml_pick}")
-        st.write(f"EV: {round(ev_ml,2)}% {grade(ev_ml)}")
+        st.write("Moneyline")
+        st.write(f"{ml_pick} | EV: {round(ev_ml,2)}% {grade(ev_ml)}")
 
-        st.write("⚾ TOTALS")
-        st.write(f"Pick: {tot_pick}")
-        st.write(f"EV: {round(ev_tot,2)}% {grade(ev_tot)}")
+        st.write("Totals")
+        st.write(f"{tot_pick} | EV: {round(ev_tot,2)}% {grade(ev_tot)}")
 
-        st.write("📊 SPREAD")
-        st.write(f"Pick: {spread_pick}")
-        st.write(f"EV: {round(ev_spread,2)}% {grade(ev_spread)}")
+        st.write("Spread")
+        st.write(f"{spread_pick} | EV: {round(ev_spread,2)}% {grade(ev_spread)}")
 
     with c3:
-        st.write("📊 Model Outputs")
-        st.write(f"Win Prob: {round(p_home*100,2)}%")
+        st.write("Model")
+        st.write(f"Win %: {round(p_home*100,2)}")
         st.write(f"Total: {round(total,2)}")
         st.write(f"Spread: {round(spread,2)}")
 
-    # =========================
-    # ADD BETS (ALL MARKETS)
-    # =========================
-    if st.button(f"➕ Add Bets {home}", key=f"{home}_{away}"):
+    # ADD BETS
+    if st.button(f"Add Bets {home}", key=f"{home}_{away}"):
 
         st.session_state.bets.append({
             "game": f"{away} @ {home}",
@@ -268,7 +221,7 @@ for g in games:
 
         st.session_state.bets.append({
             "game": f"{away} @ {home}",
-            "type": "TOTALS",
+            "type": "TOTAL",
             "pick": tot_pick,
             "odds": -110,
             "stake": 10,
@@ -287,7 +240,7 @@ for g in games:
         })
 
 # =========================
-# TRACKER (FULL EDITABLE)
+# TRACKER (EDITABLE)
 # =========================
 st.header("📒 Bet Tracker")
 
@@ -295,18 +248,12 @@ if len(st.session_state.bets) > 0:
 
     df = pd.DataFrame(st.session_state.bets)
 
-    edited = st.data_editor(
-        df,
-        num_rows="dynamic",
-        use_container_width=True
-    )
+    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
     st.session_state.bets = edited.to_dict("records")
 
     for i in range(len(st.session_state.bets)):
-
-        if st.button(f"🗑 Delete Bet {i}", key=f"del_{i}"):
-
+        if st.button(f"Delete {i}", key=f"del_{i}"):
             st.session_state.bets.pop(i)
             st.rerun()
 
