@@ -11,17 +11,17 @@ st.set_page_config(layout="wide")
 # HEADER
 # -----------------------------
 today = datetime.now().strftime("%A %d %B %Y")
-st.title("⚾ MLB Betting Engine v4 (LIVE TEAM STRENGTH)")
+st.title("⚾ MLB Betting Engine v5 (Clean Logic Fix)")
 st.subheader(f"📅 Slate: {today}")
 
 # -----------------------------
-# BET TRACKER
+# TRACKER
 # -----------------------------
 if "bets" not in st.session_state:
     st.session_state.bets = []
 
 # -----------------------------
-# MLB SCHEDULE (CORRECT)
+# MLB SCHEDULE
 # -----------------------------
 def get_mlb_schedule():
     url = (
@@ -50,18 +50,13 @@ def get_mlb_schedule():
 games = get_mlb_schedule()
 
 # -----------------------------
-# LIVE TEAM STATS (MLB API)
+# LIVE TEAM STRENGTH (MLB API BASED)
 # -----------------------------
-def get_team_offense_rankings():
-    """
-    Pulls live MLB hitting stats and converts into strength score.
-    """
-
+def get_team_strengths():
     url = "https://statsapi.mlb.com/api/v1/stats?stats=season&group=hitting&sportId=1"
     data = requests.get(url).json()
 
     teams = {}
-
     stats = data.get("stats", [])[0].get("splits", [])
 
     for t in stats:
@@ -71,27 +66,22 @@ def get_team_offense_rankings():
         runs = float(t["stat"].get("runs", 0))
         avg = float(t["stat"].get("avg", 0))
 
-        # weighted composite offensive score
         score = (ops * 100) + (runs / 10) + (avg * 1000)
-
         teams[name] = score
 
-    # normalize
-    max_val = max(teams.values()) if teams else 1
+    if not teams:
+        return {}
 
+    mx = max(teams.values())
     for k in teams:
-        teams[k] = teams[k] / max_val
+        teams[k] /= mx
 
     return teams
 
-TEAM_OFFENSE = get_team_offense_rankings()
-
-# fallback safety
-if not TEAM_OFFENSE:
-    TEAM_OFFENSE = {}
+TEAM = get_team_strengths()
 
 # -----------------------------
-# PITCHER IMPACT (REALISTIC SCALE)
+# PITCHER IMPACT
 # -----------------------------
 def pitcher_strength(name):
     if name == "TBD":
@@ -110,67 +100,36 @@ def pitcher_strength(name):
     return 0.05
 
 # -----------------------------
-# LIVE TEAM STRENGTH
+# CORE MODELS
 # -----------------------------
-def team_strength(team):
-    return TEAM_OFFENSE.get(team, 0.5)
+def team_strength(name):
+    return TEAM.get(name, 0.5)
 
-# -----------------------------
-# MONEYLINE MODEL
-# -----------------------------
 def win_prob(home, away, hp, ap):
-
-    h = team_strength(home)
-    a = team_strength(away)
-
-    h += pitcher_strength(hp)
-    a += pitcher_strength(ap)
-
-    h += 0.03  # home advantage
+    h = team_strength(home) + pitcher_strength(hp) + 0.03
+    a = team_strength(away) + pitcher_strength(ap)
 
     diff = (h - a)
 
-    prob = 1 / (1 + math.exp(-diff * 8))
+    return 1 / (1 + math.exp(-diff * 8))
 
-    return max(0.2, min(0.8, prob))
-
-# -----------------------------
-# RUN MODEL (LIVE DATA BASED)
-# -----------------------------
-def expected_runs(team, opp_pitcher):
-
+def expected_runs(team, opp_pitch):
     base = team_strength(team)
+    pitch = pitcher_strength(opp_pitch)
 
-    pitch_adj = pitcher_strength(opp_pitcher)
+    return max(2.0, min(6.5, 4.5 * base * (1 - pitch)))
 
-    runs = 4.5 * base * (1 - pitch_adj)
-
-    return max(2.0, min(6.5, runs))
-
-# -----------------------------
-# TOTALS
-# -----------------------------
 def totals_model(home, away, hp, ap):
-
     hr = expected_runs(home, ap)
     ar = expected_runs(away, hp)
 
-    total = hr + ar
+    return round(hr + ar, 2), round(hr, 2), round(ar, 2)
 
-    return round(total, 2), round(hr, 2), round(ar, 2)
-
-# -----------------------------
-# SPREAD MODEL
-# -----------------------------
 def spread_model(home, away, hp, ap):
-
-    h = expected_runs(home, ap)
-    a = expected_runs(away, hp)
-
-    return round(h - a, 2)
+    return round(expected_runs(home, ap) - expected_runs(away, hp), 2)
 
 # -----------------------------
-# EDGE FUNCTIONS
+# EDGE CALCULATION
 # -----------------------------
 def ml_edge(p):
     return round((p - 0.5) * 100, 2)
@@ -181,19 +140,22 @@ def total_edge(t):
 def spread_edge(s):
     return round(s * 10, 2)
 
-def grade(e):
-    if e < 0:
-        return "🔴 NO BET (NEGATIVE EDGE)"
-    if e >= 6:
-        return "🟢 STRONG BET"
-    if e >= 3:
-        return "🟡 VALUE"
-    return "🔴 NO BET"
+# -----------------------------
+# CLEAN GRADING (FIXED)
+# -----------------------------
+def grade(edge):
+    if edge <= 0:
+        return "NO BET"
+    elif edge >= 5:
+        return "STRONG BET"
+    elif edge >= 2:
+        return "LEAN"
+    return "NO BET"
 
 # -----------------------------
-# UI
+# DISPLAY
 # -----------------------------
-st.header("📊 Live MLB Slate (Data Driven)")
+st.header("📊 Full Slate")
 
 for home, away, hp, ap in games:
 
@@ -203,43 +165,41 @@ for home, away, hp, ap in games:
     col1, col2, col3 = st.columns(3)
 
     p = win_prob(home, away, hp, ap)
-
     total, hr, ar = totals_model(home, away, hp, ap)
-
     spread = spread_model(home, away, hp, ap)
+
+    ml_e = ml_edge(p)
+    t_e = total_edge(total)
+    s_e = spread_edge(spread)
 
     with col1:
         st.write("🏟️ Pitchers")
         st.write(f"Away: {ap}")
         st.write(f"Home: {hp}")
 
-        e = ml_edge(p)
         st.write("📈 Moneyline")
-        st.write(f"Win Prob: {round(p*100,2)}%")
-        st.write(f"Edge: {e}% {grade(abs(e))}")
+        st.write(f"{round(p*100,2)}%")
+        st.write(f"Edge: {ml_e}% {grade(ml_e)}")
 
     with col2:
-        e2 = total_edge(total)
-
         st.write("⚾ Totals")
-        st.write(f"Projected: {total}")
+        st.write(f"{total}")
         st.write(f"{home}: {hr}")
         st.write(f"{away}: {ar}")
-        st.write(f"Edge: {e2}% {grade(abs(e2))}")
+        st.write(f"Edge: {t_e}% {grade(t_e)}")
 
     with col3:
-        e3 = spread_edge(spread)
-
         st.write("📊 Spread")
-        st.write(f"Run Diff: {spread}")
-        st.write(f"Edge: {e3}% {grade(abs(e3))}")
+        st.write(f"{spread}")
+        st.write(f"Edge: {s_e}% {grade(s_e)}")
 
+    # BET TRACKER
     if st.button(f"➕ Add Bet {away} @ {home}", key=str(uuid.uuid4())):
         st.session_state.bets.append({
             "game": f"{away} @ {home}",
-            "ml_prob": round(p, 3),
-            "total": total,
-            "spread": spread,
+            "ml_edge": ml_e,
+            "total_edge": t_e,
+            "spread_edge": s_e,
             "status": "open"
         })
 
