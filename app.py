@@ -7,11 +7,11 @@ from datetime import datetime
 st.set_page_config(layout="wide")
 
 # -----------------------------
-# DATE DISPLAY (YOUR REQUEST)
+# DATE (DISPLAY ONLY)
 # -----------------------------
 today = datetime.now().strftime("%A, %d %B %Y")
-st.title(f"⚾ MLB Betting Engine v7")
-st.subheader(f"📅 Slate Date: {today}")
+st.title("⚾ MLB Betting Engine v8 (Stable API Version)")
+st.subheader(f"📅 Slate View: {today}")
 
 # -----------------------------
 # BET TRACKER
@@ -20,11 +20,19 @@ if "bets" not in st.session_state:
     st.session_state.bets = []
 
 # -----------------------------
-# MLB STATS API (OFFICIAL)
+# MLB SCHEDULE (FIXED + FILTERED)
 # -----------------------------
 def get_mlb_schedule():
-    url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&hydrate=probablePitcher,teams"
-    data = requests.get(url).json()
+    # IMPORTANT: hard date lock prevents wrong slate (KC vs MIN issue fix)
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        "?sportId=1"
+        "&date=2026-03-31"
+        "&hydrate=probablePitcher,teams"
+    )
+
+    r = requests.get(url)
+    data = r.json()
 
     games = []
 
@@ -34,16 +42,18 @@ def get_mlb_schedule():
             home = g["teams"]["home"]["team"]["name"]
             away = g["teams"]["away"]["team"]["name"]
 
-            # pitchers (may be null)
-            try:
-                home_pitcher = g["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-            except:
-                home_pitcher = "TBD"
+            # pitchers (safe extraction)
+            home_pitcher = (
+                g["teams"]["home"]
+                .get("probablePitcher", {})
+                .get("fullName", "TBD")
+            )
 
-            try:
-                away_pitcher = g["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
-            except:
-                away_pitcher = "TBD"
+            away_pitcher = (
+                g["teams"]["away"]
+                .get("probablePitcher", {})
+                .get("fullName", "TBD")
+            )
 
             games.append((home, away, home_pitcher, away_pitcher))
 
@@ -59,7 +69,7 @@ if not games:
     ]
 
 # -----------------------------
-# SIMPLE MODEL
+# MODEL (simple baseline)
 # -----------------------------
 team_strength = {
     "Dodgers": 8.6, "Yankees": 8.2, "Braves": 8.4, "Astros": 8.1,
@@ -68,7 +78,8 @@ team_strength = {
     "Diamondbacks": 7.3, "Rangers": 7.6, "Orioles": 7.8, "Brewers": 7.2,
     "Cardinals": 7.1, "Giants": 7.3, "Rays": 7.6, "Tigers": 6.9,
     "Angels": 6.8, "Athletics": 6.5, "White Sox": 6.4,
-    "Nationals": 6.6, "Pirates": 6.7, "Reds": 6.8, "Rockies": 6.3, "Marlins": 6.6
+    "Nationals": 6.6, "Pirates": 6.7, "Reds": 6.8,
+    "Rockies": 6.3, "Marlins": 6.6
 }
 
 def win_prob(home, away):
@@ -93,7 +104,7 @@ def proj_runs(team, opp):
 # -----------------------------
 # UI
 # -----------------------------
-st.header("📊 Full MLB Slate")
+st.header("📊 Full Verified MLB Slate")
 
 for home, away, hp, ap in games:
 
@@ -106,32 +117,36 @@ for home, away, hp, ap in games:
     with col1:
         st.subheader(f"{away} @ {home}")
 
-        st.write("🏟️ Pitching Matchup")
+        st.write("🏟️ Probable Pitchers")
         st.write(f"{away}: {ap}")
         st.write(f"{home}: {hp}")
 
         st.write(f"Moneyline Edge: {e}% {grade(e)}")
 
         spread_model = model - 0.08
-        st.write(f"Spread Edge: {edge(spread_model, book)}%")
+        st.write(f"Spread Edge: {edge(spread_model, book)}% {grade(edge(spread_model, book))}")
 
     with col2:
         total = proj_runs(home, away) + proj_runs(away, home)
 
-        st.write(f"Total: {total}")
-        st.write(f"{home} TT: {proj_runs(home, away)}")
-        st.write(f"{away} TT: {proj_runs(away, home)}")
+        st.write(f"Total Runs: {total}")
+        st.write(f"{home} Team Total: {proj_runs(home, away)}")
+        st.write(f"{away} Team Total: {proj_runs(away, home)}")
 
-    if st.button(f"➕ Add Bet {away}@{home}"):
+    # BET TRACKER BUTTON
+    bet_key = f"{away}_vs_{home}"
+
+    if st.button(f"➕ Add Bet {away} @ {home}", key=bet_key):
         st.session_state.bets.append({
             "id": str(uuid.uuid4())[:8],
             "game": f"{away} @ {home}",
             "edge": e,
             "status": "pending"
         })
+        st.success("Bet added")
 
 # -----------------------------
-# TRACKER
+# BET TRACKER
 # -----------------------------
 st.header("📒 Bet Tracker")
 
