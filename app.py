@@ -3,15 +3,16 @@ import requests
 import pandas as pd
 import uuid
 from datetime import datetime
+import math
 
 st.set_page_config(layout="wide")
 
 # -----------------------------
-# DATE (DISPLAY ONLY)
+# HEADER DATE
 # -----------------------------
-today = datetime.now().strftime("%A, %d %B %Y")
-st.title("⚾ MLB Betting Engine v8 (Stable API Version)")
-st.subheader(f"📅 Slate View: {today}")
+today = datetime.now().strftime("%A %d %B %Y")
+st.title("⚾ MLB Betting Engine v3 (Real Model Split)")
+st.subheader(f"📅 Slate: {today}")
 
 # -----------------------------
 # BET TRACKER
@@ -20,10 +21,9 @@ if "bets" not in st.session_state:
     st.session_state.bets = []
 
 # -----------------------------
-# MLB SCHEDULE (FIXED + FILTERED)
+# MLB SCHEDULE (CORRECT + STABLE)
 # -----------------------------
 def get_mlb_schedule():
-    # IMPORTANT: hard date lock prevents wrong slate (KC vs MIN issue fix)
     url = (
         "https://statsapi.mlb.com/api/v1/schedule"
         "?sportId=1"
@@ -31,9 +31,7 @@ def get_mlb_schedule():
         "&hydrate=probablePitcher,teams"
     )
 
-    r = requests.get(url)
-    data = r.json()
-
+    data = requests.get(url).json()
     games = []
 
     for d in data.get("dates", []):
@@ -42,54 +40,110 @@ def get_mlb_schedule():
             home = g["teams"]["home"]["team"]["name"]
             away = g["teams"]["away"]["team"]["name"]
 
-            # pitchers (safe extraction)
-            home_pitcher = (
-                g["teams"]["home"]
-                .get("probablePitcher", {})
-                .get("fullName", "TBD")
-            )
-
-            away_pitcher = (
-                g["teams"]["away"]
-                .get("probablePitcher", {})
-                .get("fullName", "TBD")
-            )
+            home_pitcher = g["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
+            away_pitcher = g["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
 
             games.append((home, away, home_pitcher, away_pitcher))
 
     return games
 
+
 games = get_mlb_schedule()
 
-# fallback safety
 if not games:
-    games = [
-        ("Dodgers", "Guardians", "TBD", "TBD"),
-        ("Yankees", "Mariners", "TBD", "TBD"),
-    ]
+    st.error("No games found for selected date.")
+    st.stop()
 
 # -----------------------------
-# MODEL (simple baseline)
+# TEAM RATINGS (IMPROVED BASELINE)
 # -----------------------------
 team_strength = {
-    "Dodgers": 8.6, "Yankees": 8.2, "Braves": 8.4, "Astros": 8.1,
-    "Mets": 7.3, "Mariners": 7.6, "Guardians": 7.2, "Red Sox": 7.0,
-    "Cubs": 7.4, "Phillies": 7.8, "Padres": 7.7, "Blue Jays": 7.5,
-    "Diamondbacks": 7.3, "Rangers": 7.6, "Orioles": 7.8, "Brewers": 7.2,
-    "Cardinals": 7.1, "Giants": 7.3, "Rays": 7.6, "Tigers": 6.9,
-    "Angels": 6.8, "Athletics": 6.5, "White Sox": 6.4,
-    "Nationals": 6.6, "Pirates": 6.7, "Reds": 6.8,
-    "Rockies": 6.3, "Marlins": 6.6
+    "Dodgers": 8.9, "Yankees": 8.4, "Braves": 8.7, "Astros": 8.3,
+    "Mets": 7.5, "Mariners": 7.8, "Guardians": 7.3, "Red Sox": 7.2,
+    "Phillies": 8.1, "Blue Jays": 7.7, "Padres": 7.9, "Rangers": 7.8,
+    "Orioles": 8.1, "Brewers": 7.4, "Cardinals": 7.3, "Giants": 7.4,
+    "Rays": 7.7, "Tigers": 6.9, "Angels": 6.8, "Athletics": 6.5,
+    "White Sox": 6.4, "Nationals": 6.6, "Pirates": 6.7,
+    "Reds": 6.9, "Rockies": 6.2, "Marlins": 6.6, "Cubs": 7.5,
+    "Diamondbacks": 7.5
 }
 
-def win_prob(home, away):
-    h = team_strength.get(home, 7.0)
-    a = team_strength.get(away, 7.0)
-    diff = (h - a) / 10
-    return max(0.30, min(0.70, 0.5 + diff))
+# -----------------------------
+# PITCHER IMPACT MODEL
+# -----------------------------
+def pitcher_rating(name):
+    if name == "TBD":
+        return 0
 
-def edge(model, book):
-    return round((model - book) * 100, 2)
+    elite = ["Cole", "Strider", "Burnes", "Skubal", "Valdez", "Gausman", "Wheeler"]
+    good = ["Lugo", "Taillon", "Gray", "Pivetta", "Giolito", "Rodon"]
+
+    for p in elite:
+        if p in name:
+            return 0.7
+    for p in good:
+        if p in name:
+            return 0.3
+
+    return 0.0
+
+# -----------------------------
+# MONEYLINE MODEL
+# -----------------------------
+def win_prob(home, away, hp, ap):
+
+    h = team_strength.get(home, 7)
+    a = team_strength.get(away, 7)
+
+    h += pitcher_rating(hp)
+    a += pitcher_rating(ap)
+
+    h += 0.25  # home advantage
+
+    diff = (h - a)
+
+    prob = 1 / (1 + math.exp(-diff / 1.6))
+
+    return max(0.20, min(0.80, prob))
+
+# -----------------------------
+# TOTALS MODEL
+# -----------------------------
+def totals_model(home, away, hp, ap):
+
+    h_off = team_strength.get(home, 7)
+    a_off = team_strength.get(away, 7)
+
+    h_pitch = pitcher_rating(hp)
+    a_pitch = pitcher_rating(ap)
+
+    home_runs = (h_off + (5 - a_pitch)) / 2.1
+    away_runs = (a_off + (5 - h_pitch)) / 2.1
+
+    total = home_runs + away_runs
+
+    return round(total, 2), round(home_runs, 2), round(away_runs, 2)
+
+# -----------------------------
+# SPREAD MODEL
+# -----------------------------
+def spread_model(home, away, hp, ap):
+
+    prob = win_prob(home, away, hp, ap)
+
+    return round((prob - 0.5) * 6, 2)
+
+# -----------------------------
+# EDGE FUNCTIONS (REAL VARIANCE NOW)
+# -----------------------------
+def ml_edge(model_prob):
+    return round((model_prob - 0.5) * 100, 2)
+
+def total_edge(total):
+    return round((total - 8.6) * 4, 2)
+
+def spread_edge(val):
+    return round(val * 10, 2)
 
 def grade(e):
     if e >= 3:
@@ -98,59 +152,66 @@ def grade(e):
         return "🟡 LEAN"
     return "🔴 NO BET"
 
-def proj_runs(team, opp):
-    return round((team_strength.get(team, 7) + team_strength.get(opp, 7)) / 3, 1)
-
 # -----------------------------
-# UI
+# DISPLAY SLATE
 # -----------------------------
-st.header("📊 Full Verified MLB Slate")
+st.header("📊 Full MLB Slate")
 
 for home, away, hp, ap in games:
 
-    col1, col2 = st.columns(2)
+    st.markdown("---")
 
-    model = win_prob(home, away)
-    book = model - 0.015
-    e = edge(model, book)
+    st.subheader(f"{away} @ {home}")
+
+    col1, col2, col3 = st.columns(3)
+
+    # models
+    p = win_prob(home, away, hp, ap)
+    total, hr, ar = totals_model(home, away, hp, ap)
+    spread = spread_model(home, away, hp, ap)
 
     with col1:
-        st.subheader(f"{away} @ {home}")
+        st.write("🏟️ Pitchers")
+        st.write(f"Away: {ap}")
+        st.write(f"Home: {hp}")
 
-        st.write("🏟️ Probable Pitchers")
-        st.write(f"{away}: {ap}")
-        st.write(f"{home}: {hp}")
-
-        st.write(f"Moneyline Edge: {e}% {grade(e)}")
-
-        spread_model = model - 0.08
-        st.write(f"Spread Edge: {edge(spread_model, book)}% {grade(edge(spread_model, book))}")
+        st.write("📈 Moneyline")
+        st.write(f"Win Prob: {round(p*100,2)}%")
+        e1 = ml_edge(p)
+        st.write(f"Edge: {e1}% {grade(abs(e1))}")
 
     with col2:
-        total = proj_runs(home, away) + proj_runs(away, home)
+        st.write("⚾ Totals")
+        st.write(f"Projected Total: {total}")
+        st.write(f"{home} TT: {hr}")
+        st.write(f"{away} TT: {ar}")
 
-        st.write(f"Total Runs: {total}")
-        st.write(f"{home} Team Total: {proj_runs(home, away)}")
-        st.write(f"{away} Team Total: {proj_runs(away, home)}")
+        e2 = total_edge(total)
+        st.write(f"Edge: {e2}% {grade(abs(e2))}")
 
-    # BET TRACKER BUTTON
-    bet_key = f"{away}_vs_{home}"
+    with col3:
+        st.write("📊 Spread")
+        st.write(f"Run Diff: {spread}")
 
-    if st.button(f"➕ Add Bet {away} @ {home}", key=bet_key):
+        e3 = spread_edge(spread)
+        st.write(f"Edge: {e3}% {grade(abs(e3))}")
+
+    # BET TRACKER
+    if st.button(f"➕ Add Bet {away} @ {home}", key=str(uuid.uuid4())):
         st.session_state.bets.append({
-            "id": str(uuid.uuid4())[:8],
             "game": f"{away} @ {home}",
-            "edge": e,
-            "status": "pending"
+            "ml_prob": round(p, 3),
+            "total": total,
+            "spread": spread,
+            "status": "open"
         })
-        st.success("Bet added")
 
 # -----------------------------
-# BET TRACKER
+# TRACKER
 # -----------------------------
 st.header("📒 Bet Tracker")
 
 if st.session_state.bets:
     st.dataframe(pd.DataFrame(st.session_state.bets))
 else:
-    st.info("No bets yet")
+    st.info("No bets added yet.")
