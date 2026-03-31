@@ -1,56 +1,93 @@
 import streamlit as st
 import pandas as pd
+import requests
 import uuid
+import datetime
 
 st.set_page_config(layout="wide")
-st.title("⚾ MLB Betting Engine v4 (Real Model Base)")
+st.title("⚾ MLB Betting Engine v5 (Live Slate + Pitchers)")
 
 # -----------------------------
-# SESSION DB
+# SESSION STORAGE
 # -----------------------------
 if "bets" not in st.session_state:
     st.session_state.bets = []
 
 # -----------------------------
-# REALISTIC TEAM DATA (BASE MODEL)
+# GET REAL MLB SLATE + PITCHERS
+# ESPN PROBABLE PITCHERS FEED
 # -----------------------------
-teams = {
-    "Dodgers": {"pitch": 8.5, "off": 5.3, "bull": 7.8},
-    "Guardians": {"pitch": 7.2, "off": 4.4, "bull": 7.0},
-    "Yankees": {"pitch": 8.1, "off": 5.0, "bull": 7.5},
-    "Mariners": {"pitch": 7.8, "off": 4.5, "bull": 7.3},
-    "Braves": {"pitch": 8.3, "off": 5.2, "bull": 7.6},
-    "Mets": {"pitch": 7.4, "off": 4.6, "bull": 6.9},
-    "Astros": {"pitch": 8.0, "off": 5.1, "bull": 7.4},
-    "Red Sox": {"pitch": 7.0, "off": 4.7, "bull": 6.8}
-}
+def get_mlb_games():
+    url = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
+    data = requests.get(url).json()
 
-games = [
-    ("Dodgers", "Guardians"),
-    ("Yankees", "Mariners"),
-    ("Braves", "Mets"),
-    ("Astros", "Red Sox")
-]
+    games = []
+
+    for event in data.get("events", []):
+        try:
+            comp = event["competitions"][0]
+            home = comp["competitors"][0]["team"]["displayName"]
+            away = comp["competitors"][1]["team"]["displayName"]
+
+            home_pitcher = "TBD"
+            away_pitcher = "TBD"
+
+            # try pitcher info
+            for c in comp["competitors"]:
+                try:
+                    if "probables" in c:
+                        p = c["probables"][0]["athlete"]["displayName"]
+                    else:
+                        p = "TBD"
+                except:
+                    p = "TBD"
+
+                if c["homeAway"] == "home":
+                    home_pitcher = p
+                else:
+                    away_pitcher = p
+
+            games.append((home, away, home_pitcher, away_pitcher))
+
+        except:
+            continue
+
+    return games
+
+games = get_mlb_games()
+
+# fallback if API fails
+if not games:
+    games = [
+        ("Dodgers", "Guardians", "TBD", "TBD"),
+        ("Yankees", "Mariners", "TBD", "TBD")
+    ]
+
+# -----------------------------
+# SIMPLE TEAM MODEL (UPGRADE LATER TO REAL STATS FEED)
+# -----------------------------
+team_strength = {
+    "Dodgers": 8.6,
+    "Yankees": 8.2,
+    "Braves": 8.4,
+    "Astros": 8.1,
+    "Mets": 7.3,
+    "Mariners": 7.6,
+    "Guardians": 7.2,
+    "Red Sox": 7.0
+}
 
 # -----------------------------
 # MODEL FUNCTIONS
 # -----------------------------
 def win_prob(home, away):
-    h = teams[home]
-    a = teams[away]
+    h = team_strength.get(home, 7.5)
+    a = team_strength.get(away, 7.5)
 
-    score = (
-        (h["pitch"] - a["pitch"]) * 0.5 +
-        (h["off"] - a["off"]) * 0.3 +
-        (h["bull"] - a["bull"]) * 0.2
-    )
+    diff = (h - a) / 10
+    prob = 0.5 + diff
 
-    prob = 0.5 + score / 10
-    return max(0.3, min(0.7, prob))
-
-def runs_proj(team):
-    t = teams[team]
-    return round((t["off"] * 0.7 + t["pitch"] * 0.3) / 2, 1)
+    return max(0.30, min(0.70, prob))
 
 def edge(model, book):
     return round((model - book) * 100, 2)
@@ -62,42 +99,52 @@ def grade(e):
         return "🟡 LEAN"
     return "🔴 NO BET"
 
+def run_projection(home, away):
+    h = team_strength.get(home, 7.5)
+    a = team_strength.get(away, 7.5)
+    return round((h + a) / 3, 1)
+
 # -----------------------------
 # GAME BOARD
 # -----------------------------
-st.header("📊 Full Game Board")
+st.header("📊 Live MLB Slate")
 
-for home, away in games:
+for home, away, hp, ap in games:
 
     col1, col2 = st.columns(2)
 
     model_ml = win_prob(home, away)
-    book_ml = model_ml - 0.02  # placeholder
+    book_ml = model_ml - 0.015
 
     e_ml = edge(model_ml, book_ml)
 
     with col1:
         st.subheader(f"{home} vs {away}")
 
-        st.write(f"ML ({home}): {round(model_ml*100,1)}%")
+        # pitchers
+        st.write("🏟️ Pitching Matchup")
+        st.write(f"{home}: {hp}")
+        st.write(f"{away}: {ap}")
+
+        # ML
+        st.write(f"Moneyline ({home}): {round(model_ml*100,1)}%")
         st.write(f"Edge: {e_ml}% {grade(e_ml)}")
 
-        spread_prob = model_ml - 0.08
-        e_spread = edge(spread_prob, book_ml)
-
-        st.write(f"Spread -1.5 ({home}) Edge: {e_spread}% {grade(e_spread)}")
+        # Spread
+        spread_model = model_ml - 0.08
+        e_spread = edge(spread_model, book_ml)
+        st.write(f"Spread Edge: {e_spread}% {grade(e_spread)}")
 
     with col2:
-        home_runs = runs_proj(home)
-        away_runs = runs_proj(away)
+        home_runs = run_projection(home, away)
+        away_runs = run_projection(away, home)
         total = home_runs + away_runs
 
-        st.write(f"Total: {total}")
+        st.write(f"Total Runs: {total}")
         st.write(f"{home} TT: {home_runs}")
         st.write(f"{away} TT: {away_runs}")
 
         total_edge = edge(total/10, 0.5)
-
         st.write(f"Total Edge: {total_edge}% {grade(total_edge)}")
 
     if st.button(f"➕ Add Bet {home}"):
@@ -118,3 +165,28 @@ if st.session_state.bets:
     st.dataframe(pd.DataFrame(st.session_state.bets))
 else:
     st.info("No bets yet")
+
+# -----------------------------
+# SETTLE
+# -----------------------------
+st.header("✔️ Settle Bet")
+
+bet_id = st.text_input("Bet ID")
+result = st.selectbox("Result", ["win", "loss"])
+
+if st.button("Settle"):
+    for b in st.session_state.bets:
+        if b["id"] == bet_id:
+            b["status"] = result
+            st.success("Settled")
+
+# -----------------------------
+# DELETE
+# -----------------------------
+st.header("❌ Delete Bet")
+
+del_id = st.text_input("Delete Bet ID")
+
+if st.button("Delete"):
+    st.session_state.bets = [b for b in st.session_state.bets if b["id"] != del_id]
+    st.warning("Deleted")
