@@ -182,10 +182,12 @@ def spread_edge(s):
     return round(s * 10, 2)
 
 def grade(e):
-    if abs(e) >= 5:
-        return "🟢 BET"
-    elif abs(e) >= 2:
-        return "🟡 LEAN"
+    if e < 0:
+        return "🔴 NO BET (NEGATIVE EDGE)"
+    if e >= 6:
+        return "🟢 STRONG BET"
+    if e >= 3:
+        return "🟡 VALUE"
     return "🔴 NO BET"
 
 # -----------------------------
