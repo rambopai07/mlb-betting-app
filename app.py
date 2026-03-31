@@ -6,7 +6,7 @@ from datetime import datetime
 
 st.set_page_config(layout="wide")
 
-st.title("⚾ MLB Betting Engine V11 (Real Model)")
+st.title("⚾ MLB Betting Engine V11.1 (Full Model + Tracker)")
 
 st.subheader(datetime.now().strftime("%A %d %B %Y"))
 
@@ -20,9 +20,7 @@ if "bets" not in st.session_state:
 # MLB SCHEDULE
 # =========================
 def get_games():
-
     url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&hydrate=probablePitcher,teams"
-
     data = requests.get(url).json()
 
     games = []
@@ -42,63 +40,63 @@ def get_games():
 games = get_games()
 
 # =========================
-# TEAM OFFENSE (proxy)
+# OFFENSE (proxy but stable)
 # =========================
 def offense(team):
-
     base = {
         "Dodgers": 0.18, "Braves": 0.17, "Yankees": 0.15,
         "Astros": 0.14, "Phillies": 0.13, "Orioles": 0.13,
-        "Mets": 0.09, "Mariners": 0.10, "Guardians": 0.08
+        "Mets": 0.09, "Mariners": 0.10, "Guardians": 0.08,
+        "Red Sox": 0.11, "Cubs": 0.10
     }
-
     return base.get(team, 0.10)
 
 # =========================
 # DEFENSE
 # =========================
 def defense(team):
-
     base = {
         "Dodgers": 0.12, "Braves": 0.11, "Yankees": 0.10,
-        "Astros": 0.11, "Phillies": 0.10
+        "Astros": 0.11, "Phillies": 0.10, "Orioles": 0.11
     }
-
     return base.get(team, 0.08)
+
+# =========================
+# BULLPEN
+# =========================
+def bullpen(team):
+    base = {
+        "Dodgers": 0.08, "Braves": 0.07, "Yankees": 0.06,
+        "Astros": 0.06, "Phillies": 0.05, "Orioles": 0.06
+    }
+    return base.get(team, 0.04)
 
 # =========================
 # PARK FACTOR
 # =========================
 def park_factor(team):
+    hitter = ["Yankees", "Red Sox", "Cubs", "Rangers"]
+    pitcher = ["Dodgers", "Mets", "Mariners"]
 
-    hitter_parks = ["Yankees", "Red Sox", "Cubs", "Rangers"]
-    pitcher_parks = ["Dodgers", "Mets", "Mariners"]
-
-    if team in hitter_parks:
+    if team in hitter:
         return 0.02
-    if team in pitcher_parks:
+    if team in pitcher:
         return -0.02
-
     return 0
 
 # =========================
-# PITCHER MODEL
+# PITCHER MODEL (REAL MLB API)
 # =========================
 def pitcher_rating(p):
 
     if not p:
         return 0
 
-    era = 4.3
-    whip = 1.25
-    k9 = 8.5
-    bb9 = 3.0
-    ip = 120
-
     try:
         pid = p.get("id")
 
         url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
+
         data = requests.get(url, params={
             "stats": "season",
             "group": "pitching"
@@ -106,14 +104,14 @@ def pitcher_rating(p):
 
         s = data["stats"][0]["splits"][0]["stat"]
 
-        era = float(s.get("era", era))
-        whip = float(s.get("whip", whip))
-        k9 = float(s.get("strikeoutsPer9Inn", k9))
-        bb9 = float(s.get("baseOnBallsPer9Inn", bb9))
-        ip = float(s.get("inningsPitched", ip))
+        era = float(s.get("era", 4.3))
+        whip = float(s.get("whip", 1.25))
+        k9 = float(s.get("strikeoutsPer9Inn", 8.5))
+        bb9 = float(s.get("baseOnBallsPer9Inn", 3.0))
+        ip = float(s.get("inningsPitched", 120))
 
     except:
-        pass
+        era, whip, k9, bb9, ip = 4.3, 1.25, 8.5, 3.0, 120
 
     return (
         (4.5 - era) * 0.5 +
@@ -124,34 +122,11 @@ def pitcher_rating(p):
     )
 
 # =========================
-# BULLPEN (SIMPLIFIED)
-# =========================
-def bullpen(team):
-
-    base = {
-        "Dodgers": 0.08, "Braves": 0.07, "Yankees": 0.06,
-        "Astros": 0.06, "Phillies": 0.05
-    }
-
-    return base.get(team, 0.03)
-
-# =========================
-# WEATHER IMPACT
-# =========================
-def weather_adjustment():
-
-    # simplified global adjustment (can later API upgrade)
-    wind = 10
-    temp = 20
-
-    return (wind / 20) + ((temp - 20) / 50)
-
-# =========================
-# TEAM STRENGTH MODEL
+# TEAM STRENGTH (FULL MODEL)
 # =========================
 def team_strength(team, pitcher, is_home):
 
-    value = (
+    val = (
         offense(team) +
         defense(team) +
         bullpen(team) +
@@ -160,12 +135,12 @@ def team_strength(team, pitcher, is_home):
     )
 
     if is_home:
-        value += 0.03
+        val += 0.03
 
-    return value
+    return val
 
 # =========================
-# WIN PROB
+# WIN PROBABILITY
 # =========================
 def win_prob(home, away, hp, ap):
 
@@ -177,7 +152,7 @@ def win_prob(home, away, hp, ap):
     return 1 / (1 + math.exp(-diff * 6))
 
 # =========================
-# TOTALS MODEL
+# RUN MODEL (TOTALS)
 # =========================
 def expected_runs(team, pitcher):
 
@@ -186,36 +161,27 @@ def expected_runs(team, pitcher):
     return max(2.0, min(8.5, base))
 
 # =========================
-# EV ENGINE
+# ODDS / EV
 # =========================
 def american_to_prob(o):
-
     if o < 0:
         return (-o) / (-o + 100)
     return 100 / (o + 100)
 
 def ev(model_p, odds):
-
     return (model_p - american_to_prob(odds)) * 100
 
-def kelly(p, odds):
-
-    b = odds / 100 if odds > 0 else 100 / abs(odds)
-
-    return max(0, (p * (b + 1) - 1) / b)
-
 def grade(e):
-
     if e >= 5:
-        return "STRONG BET"
+        return "🟢 STRONG BET"
     if e >= 2:
-        return "LEAN"
-    return "NO BET"
+        return "🟡 LEAN"
+    return "🔴 NO BET"
 
 # =========================
 # SLATE
 # =========================
-st.header("📊 Full Slate")
+st.header("📊 Full MLB Slate")
 
 games = get_games()
 
@@ -227,16 +193,34 @@ for g in games:
     hp = g["home_pitcher"]
     ap = g["away_pitcher"]
 
+    # =====================
+    # CORE MODEL
+    # =====================
     p_home = win_prob(home, away, hp, ap)
-
-    ev_ml = ev(p_home, -110)
-
-    pick = home if p_home > 0.5 else away
 
     home_runs = expected_runs(home, ap)
     away_runs = expected_runs(away, hp)
 
     total = home_runs + away_runs
+    spread = home_runs - away_runs
+
+    # =====================
+    # MONEYLINE
+    # =====================
+    ev_ml = ev(p_home, -110)
+    ml_pick = home if p_home > 0.5 else away
+
+    # =====================
+    # TOTALS
+    # =====================
+    ev_tot = (total - 8.5) * 7
+    tot_pick = "OVER" if total > 8.5 else "UNDER"
+
+    # =====================
+    # SPREAD
+    # =====================
+    ev_spread = spread * 6
+    spread_pick = home if spread > 0 else away
 
     st.markdown("---")
     st.subheader(f"{away} @ {home}")
@@ -249,33 +233,82 @@ for g in games:
         st.write(f"Home: {hp.get('fullName','TBD')}")
 
     with c2:
-        st.write("📈 Moneyline")
-        st.write(f"Model: {round(p_home*100,2)}%")
-        st.write(f"Pick: {pick}")
+        st.write("📈 MONEYLINE")
+        st.write(f"Pick: {ml_pick}")
         st.write(f"EV: {round(ev_ml,2)}% {grade(ev_ml)}")
 
+        st.write("⚾ TOTALS")
+        st.write(f"Pick: {tot_pick}")
+        st.write(f"EV: {round(ev_tot,2)}% {grade(ev_tot)}")
+
+        st.write("📊 SPREAD")
+        st.write(f"Pick: {spread_pick}")
+        st.write(f"EV: {round(ev_spread,2)}% {grade(ev_spread)}")
+
     with c3:
-        st.write("⚾ Totals")
-        st.write(f"Projected: {round(total,2)}")
+        st.write("📊 Model Outputs")
+        st.write(f"Win Prob: {round(p_home*100,2)}%")
+        st.write(f"Total: {round(total,2)}")
+        st.write(f"Spread: {round(spread,2)}")
 
     # =========================
-    # TRACKER
+    # ADD BETS (ALL MARKETS)
     # =========================
-    if st.button(f"➕ Add Bet {home}", key=f"{home}_{away}"):
+    if st.button(f"➕ Add Bets {home}", key=f"{home}_{away}"):
 
         st.session_state.bets.append({
             "game": f"{away} @ {home}",
-            "pick": pick,
+            "type": "ML",
+            "pick": ml_pick,
             "odds": -110,
             "stake": 10,
             "ev": round(ev_ml,2),
-            "type": "ML",
+            "result": "Pending"
+        })
+
+        st.session_state.bets.append({
+            "game": f"{away} @ {home}",
+            "type": "TOTALS",
+            "pick": tot_pick,
+            "odds": -110,
+            "stake": 10,
+            "ev": round(ev_tot,2),
+            "result": "Pending"
+        })
+
+        st.session_state.bets.append({
+            "game": f"{away} @ {home}",
+            "type": "SPREAD",
+            "pick": spread_pick,
+            "odds": -110,
+            "stake": 10,
+            "ev": round(ev_spread,2),
             "result": "Pending"
         })
 
 # =========================
-# TRACKER
+# TRACKER (FULL EDITABLE)
 # =========================
-st.header("📒 Tracker")
+st.header("📒 Bet Tracker")
 
-st.dataframe(pd.DataFrame(st.session_state.bets))
+if len(st.session_state.bets) > 0:
+
+    df = pd.DataFrame(st.session_state.bets)
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    st.session_state.bets = edited.to_dict("records")
+
+    for i in range(len(st.session_state.bets)):
+
+        if st.button(f"🗑 Delete Bet {i}", key=f"del_{i}"):
+
+            st.session_state.bets.pop(i)
+            st.rerun()
+
+else:
+    st.info("No bets yet")
