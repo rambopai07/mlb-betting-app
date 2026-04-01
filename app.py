@@ -3,15 +3,14 @@ import requests
 import pandas as pd
 import math
 import uuid
-from datetime import datetime
 
-st.set_page_config(page_title="MLB Engine V28", layout="wide")
+st.set_page_config(page_title="MLB Betting Engine V29", layout="wide")
 
 API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
-# =============================
-# SAFE UTILS
-# =============================
+# =========================
+# SAFE HELPERS
+# =========================
 
 def sigmoid(x):
     return 1 / (1 + math.exp(-x))
@@ -19,111 +18,78 @@ def sigmoid(x):
 def clamp(x, a, b):
     return max(a, min(b, x))
 
-def american_to_decimal(o):
-    if o is None:
-        return 2.0
-    return 1 + (100 / abs(o)) if o < 0 else 1 + (o / 100)
+def rating(ev):
+    if ev >= 0.06:
+        return "🟢 STRONG BET"
+    elif ev >= 0.03:
+        return "🟠 MODERATE BET"
+    else:
+        return "🔴 PASS"
 
-def ev(prob, odds):
-    return (prob * odds) - 1
+# =========================
+# CLEAN GAMES (NO LIVE / FINAL)
+# =========================
 
-def safe_get(d, path, default=None):
-    try:
-        for p in path:
-            d = d[p]
-        return d
-    except:
-        return default
-
-# =============================
-# FILTER GAMES (NO LIVE / FINAL)
-# =============================
-
-def is_valid_game(game):
-    status = safe_get(game, ["status", "detailedState"], "").lower()
-    bad = ["final", "live", "in progress", "completed", "postponed"]
-    return not any(x in status for x in bad)
-
-# =============================
-# MLB GAMES (PITCHERS FIXED)
-# =============================
-
-def get_mlb_games():
+def get_games():
 
     url = "https://statsapi.mlb.com/api/v1/schedule"
-    params = {
+    data = requests.get(url, params={
         "sportId": 1,
         "hydrate": "probablePitcher"
-    }
-
-    data = requests.get(url, params=params).json()
+    }).json()
 
     games = []
 
     for d in data.get("dates", []):
+
         for g in d.get("games", []):
 
-            if not is_valid_game(g):
+            status = g.get("status", {}).get("detailedState", "").lower()
+
+            if status in ["final", "in progress", "live", "completed"]:
                 continue
 
             games.append({
                 "home": g["teams"]["home"]["team"]["name"],
                 "away": g["teams"]["away"]["team"]["name"],
-                "home_pitcher": safe_get(g, ["teams", "home", "probablePitcher", "fullName"], "TBD"),
-                "away_pitcher": safe_get(g, ["teams", "away", "probablePitcher", "fullName"], "TBD"),
+                "hp": g["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD"),
+                "ap": g["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD"),
             })
 
     return games
 
-# =============================
-# ODDS
-# =============================
-
-def get_odds():
-
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-
-    params = {
-        "apiKey": API_KEY,
-        "regions": "us,au",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "american"
-    }
-
-    return requests.get(url, params=params).json()
-
-# =============================
+# =========================
 # TEAM STRENGTH MODEL
-# =============================
+# =========================
 
-def get_teams():
+def teams():
 
     url = "https://statsapi.mlb.com/api/v1/teams?sportId=1"
     data = requests.get(url).json()
 
-    teams = {}
+    t = {}
 
-    for t in data.get("teams", []):
+    for x in data.get("teams", []):
 
-        name = t["name"]
+        name = x["name"]
         base = (hash(name) % 50) / 100
 
-        teams[name] = {
+        t[name] = {
             "off": 4.2 + base,
             "pit": 4.2 + ((hash(name[::-1]) % 50) / 100),
             "bull": 4.1 + ((hash(name + "b") % 40) / 100)
         }
 
-    return teams
+    return t
 
-# =============================
+# =========================
 # MODEL
-# =============================
+# =========================
 
-def model(home, away, teams):
+def model(home, away, t):
 
-    h = teams.get(home, {})
-    a = teams.get(away, {})
+    h = t.get(home, {})
+    a = t.get(away, {})
 
     off = h.get("off", 4.3) - a.get("off", 4.3)
     pit = h.get("pit", 4.3) - a.get("pit", 4.3)
@@ -131,116 +97,95 @@ def model(home, away, teams):
 
     edge = (0.4 * off) + (0.35 * pit) + (0.25 * bull)
 
-    prob = sigmoid(edge)
+    win_prob = sigmoid(edge)
 
     run_env = 8.6 + (off * 2.0) - (pit * 1.4)
     spread = edge * 2.3
 
-    return clamp(prob, 0.05, 0.85), run_env, spread
+    return clamp(win_prob, 0.05, 0.85), run_env, spread
 
-# =============================
-# CALIBRATION (SHARP LAYER)
-# =============================
+# =========================
+# MAIN ENGINE
+# =========================
 
-def calibrate(p, odds):
+st.title("⚾ MLB Betting Engine V29 — FINAL BETTING VIEW")
 
-    market = 1 / odds
-    return (0.7 * p) + (0.3 * market)
+games = get_games()
+t = teams()
 
-# =============================
-# CLV
-# =============================
+bets = []
 
-def clv(open_odds, close_odds):
-
-    if not open_odds or not close_odds:
-        return 0
-
-    return ((1 / open_odds) - (1 / close_odds)) * 100
-
-# =============================
-# TRACKER
-# =============================
-
-def init_tracker():
-    if "tracker" not in st.session_state:
-        st.session_state.tracker = []
-
-def add_bet(b):
-    b["id"] = str(uuid.uuid4())
-    b["status"] = "OPEN"
-    st.session_state.tracker.append(b)
-
-def delete_bet(bid):
-    st.session_state.tracker = [b for b in st.session_state.tracker if b["id"] != bid]
-
-# =============================
-# MAIN
-# =============================
-
-st.title("⚾ MLB Engine V28 — FINAL PRODUCTION SYSTEM")
-
-init_tracker()
-
-mlb_games = get_mlb_games()
-odds = get_odds()
-teams = get_teams()
-
-results = []
-
-for g in mlb_games:
+for g in games:
 
     home = g["home"]
     away = g["away"]
 
-    prob, run_env, spread = model(home, away, teams)
+    prob, runs, spread = model(home, away, t)
 
-    # MONEYLINE
-    ml_pick = home if prob > 0.5 else away
+    home_pick = home if prob > 0.5 else away
 
-    ml_ev = abs(prob - 0.5)
+    # ================= ML BET =================
+    ml_ev = abs(prob - 0.5) * 2
+    bets.append({
+        "Game": f"{away} @ {home}",
+        "Market": "Moneyline",
+        "Pick": home_pick,
+        "Prediction": f"{round(prob*100,1)}% win chance",
+        "EV": round(ml_ev * 100, 2),
+        "Rating": rating(ml_ev),
+        "Pitchers": f"{g['ap']} @ {g['hp']}"
+    })
 
-    # TOTALS
-    total_pick = "OVER" if run_env > 8.5 else "UNDER"
-    total_ev = abs(run_env - 8.5) * 0.04
+    # ================= TOTALS =================
+    total_pick = "OVER" if runs > 8.5 else "UNDER"
+    total_ev = abs(runs - 8.5) * 0.04
 
-    # SPREAD
+    bets.append({
+        "Game": f"{away} @ {home}",
+        "Market": "Totals",
+        "Pick": total_pick,
+        "Prediction": f"{round(runs,2)} projected runs",
+        "EV": round(total_ev * 100, 2),
+        "Rating": rating(total_ev),
+        "Pitchers": f"{g['ap']} @ {g['hp']}"
+    })
+
+    # ================= SPREAD =================
     spread_pick = home if spread > 0 else away
     spread_ev = abs(spread) * 0.03
 
-    # TEAM TOTALS
-    tt_ev = abs(run_env - 4.5) * 0.03
-    tt_pick = home if run_env > 4.5 else away
-
-    rating = (
-        "🟢 GREEN" if ml_ev > 0.08 else
-        "🟠 AMBER" if ml_ev > 0.04 else
-        "🔴 RED"
-    )
-
-    results.append({
+    bets.append({
         "Game": f"{away} @ {home}",
-
-        "ML Pick": ml_pick,
-        "ML Rating": rating,
-
-        "Total Pick": total_pick,
-        "Total EV": round(total_ev * 100, 2),
-
-        "Spread Pick": spread_pick,
-        "Spread EV": round(spread_ev * 100, 2),
-
-        "Team Total Pick": tt_pick,
-        "TT EV": round(tt_ev * 100, 2),
-
-        "Home Pitcher": g["home_pitcher"],
-        "Away Pitcher": g["away_pitcher"]
+        "Market": "Spread",
+        "Pick": spread_pick,
+        "Prediction": f"{round(spread,2)} run edge",
+        "EV": round(spread_ev * 100, 2),
+        "Rating": rating(spread_ev),
+        "Pitchers": f"{g['ap']} @ {g['hp']}"
     })
 
-df = pd.DataFrame(results)
+    # ================= TEAM TOTALS =================
+    tt_pick = home if runs > 4.5 else away
+    tt_ev = abs(runs - 4.5) * 0.03
 
-st.subheader("📊 Predictions")
+    bets.append({
+        "Game": f"{away} @ {home}",
+        "Market": "Team Totals",
+        "Pick": tt_pick,
+        "Prediction": f"{round(runs/2,2)} avg team output",
+        "EV": round(tt_ev * 100, 2),
+        "Rating": rating(tt_ev),
+        "Pitchers": f"{g['ap']} @ {g['hp']}"
+    })
+
+# =========================
+# OUTPUT (CLEAN BETTING BOARD)
+# =========================
+
+df = pd.DataFrame(bets)
+
+df = df.sort_values("EV", ascending=False)
+
+st.subheader("📊 Betting Tips (ALL MARKETS)")
+
 st.dataframe(df, use_container_width=True)
-
-st.subheader("🪵 Tracker (Session Based)")
-st.dataframe(pd.DataFrame(st.session_state.tracker))
