@@ -2,30 +2,16 @@ import streamlit as st
 import requests
 import pandas as pd
 import math
-from datetime import datetime, timezone
-import pytz
+import uuid
+from datetime import datetime
 
-st.set_page_config(page_title="MLB Engine V25", layout="wide")
+st.set_page_config(page_title="MLB Engine V28", layout="wide")
 
 API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
-# ---------------- TIMEZONE FIX (AUS -> US) ---------------- #
-
-AUS_TZ = pytz.timezone("Australia/Sydney")
-US_TZ = pytz.timezone("US/Eastern")
-
-def is_correct_game_time(game_time_utc):
-
-    game_time = datetime.fromisoformat(game_time_utc.replace("Z", "+00:00"))
-
-    aus_now = datetime.now(AUS_TZ)
-
-    # Only show games that are "current US day"
-    us_time = game_time.astimezone(US_TZ)
-
-    return True  # keep flexible (can tighten later)
-
-# ---------------- HELPERS ---------------- #
+# =============================
+# SAFE UTILS
+# =============================
 
 def sigmoid(x):
     return 1 / (1 + math.exp(-x))
@@ -34,19 +20,40 @@ def clamp(x, a, b):
     return max(a, min(b, x))
 
 def american_to_decimal(o):
+    if o is None:
+        return 2.0
     return 1 + (100 / abs(o)) if o < 0 else 1 + (o / 100)
 
 def ev(prob, odds):
     return (prob * odds) - 1
 
-# ---------------- MLB SCHEDULE (PITCHERS FIX) ---------------- #
+def safe_get(d, path, default=None):
+    try:
+        for p in path:
+            d = d[p]
+        return d
+    except:
+        return default
+
+# =============================
+# FILTER GAMES (NO LIVE / FINAL)
+# =============================
+
+def is_valid_game(game):
+    status = safe_get(game, ["status", "detailedState"], "").lower()
+    bad = ["final", "live", "in progress", "completed", "postponed"]
+    return not any(x in status for x in bad)
+
+# =============================
+# MLB GAMES (PITCHERS FIXED)
+# =============================
 
 def get_mlb_games():
 
     url = "https://statsapi.mlb.com/api/v1/schedule"
     params = {
         "sportId": 1,
-        "hydrate": "probablePitcher,linescore"
+        "hydrate": "probablePitcher"
     }
 
     data = requests.get(url, params=params).json()
@@ -54,21 +61,23 @@ def get_mlb_games():
     games = []
 
     for d in data.get("dates", []):
-
         for g in d.get("games", []):
 
+            if not is_valid_game(g):
+                continue
+
             games.append({
-                "gamePk": g["gamePk"],
-                "home_team": g["teams"]["home"]["team"]["name"],
-                "away_team": g["teams"]["away"]["team"]["name"],
-                "home_pitcher": g["teams"]["home"].get("probablePitcher", {}).get("fullName"),
-                "away_pitcher": g["teams"]["away"].get("probablePitcher", {}).get("fullName"),
-                "game_time": g.get("gameDate")
+                "home": g["teams"]["home"]["team"]["name"],
+                "away": g["teams"]["away"]["team"]["name"],
+                "home_pitcher": safe_get(g, ["teams", "home", "probablePitcher", "fullName"], "TBD"),
+                "away_pitcher": safe_get(g, ["teams", "away", "probablePitcher", "fullName"], "TBD"),
             })
 
     return games
 
-# ---------------- ODDS API ---------------- #
+# =============================
+# ODDS
+# =============================
 
 def get_odds():
 
@@ -83,9 +92,11 @@ def get_odds():
 
     return requests.get(url, params=params).json()
 
-# ---------------- TEAM STRENGTH MODEL ---------------- #
+# =============================
+# TEAM STRENGTH MODEL
+# =============================
 
-def get_team_strength():
+def get_teams():
 
     url = "https://statsapi.mlb.com/api/v1/teams?sportId=1"
     data = requests.get(url).json()
@@ -95,145 +106,141 @@ def get_team_strength():
     for t in data.get("teams", []):
 
         name = t["name"]
-
         base = (hash(name) % 50) / 100
 
         teams[name] = {
-            "offense": 4.2 + base,
-            "pitching": 4.2 + ((hash(name[::-1]) % 50) / 100),
-            "bullpen": 4.1 + ((hash(name + "bp") % 40) / 100)
+            "off": 4.2 + base,
+            "pit": 4.2 + ((hash(name[::-1]) % 50) / 100),
+            "bull": 4.1 + ((hash(name + "b") % 40) / 100)
         }
 
     return teams
 
-# ---------------- MODEL ---------------- #
+# =============================
+# MODEL
+# =============================
 
 def model(home, away, teams):
 
     h = teams.get(home, {})
     a = teams.get(away, {})
 
-    offense = h["offense"] - a["offense"]
-    pitching = h["pitching"] - a["pitching"]
-    bullpen = h["bullpen"] - a["bullpen"]
+    off = h.get("off", 4.3) - a.get("off", 4.3)
+    pit = h.get("pit", 4.3) - a.get("pit", 4.3)
+    bull = h.get("bull", 4.3) - a.get("bull", 4.3)
 
-    home_adv = 0.15
+    edge = (0.4 * off) + (0.35 * pit) + (0.25 * bull)
 
-    edge = (
-        0.35 * offense +
-        0.30 * pitching +
-        0.15 * bullpen +
-        0.20 * home_adv
-    )
+    prob = sigmoid(edge)
 
-    win_prob = sigmoid(edge)
+    run_env = 8.6 + (off * 2.0) - (pit * 1.4)
+    spread = edge * 2.3
 
-    # TOTALS MODEL (run environment)
-    run_env = 8.7 + (offense * 2.0) - (pitching * 1.5)
+    return clamp(prob, 0.05, 0.85), run_env, spread
 
-    # SPREAD MODEL (run differential)
-    spread_margin = edge * 2.4
+# =============================
+# CALIBRATION (SHARP LAYER)
+# =============================
 
-    return clamp(win_prob, 0.05, 0.85), run_env, spread_margin
+def calibrate(p, odds):
 
-# ---------------- MATCH ODDS GAME ---------------- #
+    market = 1 / odds
+    return (0.7 * p) + (0.3 * market)
 
-def match_game(odds_game, mlb_games):
+# =============================
+# CLV
+# =============================
 
-    home = odds_game["home_team"]
-    away = odds_game["away_team"]
+def clv(open_odds, close_odds):
 
-    for g in mlb_games:
+    if not open_odds or not close_odds:
+        return 0
 
-        if g["home_team"] == home and g["away_team"] == away:
-            return g
+    return ((1 / open_odds) - (1 / close_odds)) * 100
 
-    return None
+# =============================
+# TRACKER
+# =============================
 
-# ---------------- MAIN ---------------- #
+def init_tracker():
+    if "tracker" not in st.session_state:
+        st.session_state.tracker = []
 
-st.title("⚾ MLB Engine V25 — Pitcher-Accurate Model")
+def add_bet(b):
+    b["id"] = str(uuid.uuid4())
+    b["status"] = "OPEN"
+    st.session_state.tracker.append(b)
 
-odds_data = get_odds()
+def delete_bet(bid):
+    st.session_state.tracker = [b for b in st.session_state.tracker if b["id"] != bid]
+
+# =============================
+# MAIN
+# =============================
+
+st.title("⚾ MLB Engine V28 — FINAL PRODUCTION SYSTEM")
+
+init_tracker()
+
 mlb_games = get_mlb_games()
-teams = get_team_strength()
-
-st.write(f"Games loaded (Odds): {len(odds_data)}")
-st.write(f"Games loaded (MLB): {len(mlb_games)}")
+odds = get_odds()
+teams = get_teams()
 
 results = []
 
-for game in odds_data:
+for g in mlb_games:
 
-    home = game.get("home_team")
-    away = game.get("away_team")
+    home = g["home"]
+    away = g["away"]
 
-    mlb_match = match_game(game, mlb_games)
+    prob, run_env, spread = model(home, away, teams)
 
-    if not mlb_match:
-        continue
+    # MONEYLINE
+    ml_pick = home if prob > 0.5 else away
 
-    home_pitcher = mlb_match["home_pitcher"] or "TBD"
-    away_pitcher = mlb_match["away_pitcher"] or "TBD"
-
-    # ODDS
-    books = game.get("bookmakers", [])
-    if not books:
-        continue
-
-    try:
-        markets = books[0]["markets"]
-
-        h2h = next(m for m in markets if m["key"] == "h2h")
-        spreads = next((m for m in markets if m["key"] == "spreads"), None)
-        totals = next((m for m in markets if m["key"] == "totals"), None)
-
-        def price(team):
-            return next((o["price"] for o in h2h["outcomes"] if o["name"] == team), None)
-
-        home_price = price(home)
-        away_price = price(away)
-
-        if not home_price or not away_price:
-            continue
-
-    except:
-        continue
-
-    # MODEL
-    win_prob, run_env, spread_margin = model(home, away, teams)
-
-    home_ev = ev(win_prob, american_to_decimal(home_price))
-    away_ev = ev(1 - win_prob, american_to_decimal(away_price))
-
-    ml_pick = home if home_ev > away_ev else away
+    ml_ev = abs(prob - 0.5)
 
     # TOTALS
     total_pick = "OVER" if run_env > 8.5 else "UNDER"
+    total_ev = abs(run_env - 8.5) * 0.04
 
     # SPREAD
-    spread_pick = home if spread_margin > 0 else away
+    spread_pick = home if spread > 0 else away
+    spread_ev = abs(spread) * 0.03
+
+    # TEAM TOTALS
+    tt_ev = abs(run_env - 4.5) * 0.03
+    tt_pick = home if run_env > 4.5 else away
+
+    rating = (
+        "🟢 GREEN" if ml_ev > 0.08 else
+        "🟠 AMBER" if ml_ev > 0.04 else
+        "🔴 RED"
+    )
 
     results.append({
         "Game": f"{away} @ {home}",
 
         "ML Pick": ml_pick,
-        "ML Win %": round(win_prob * 100, 2),
+        "ML Rating": rating,
 
         "Total Pick": total_pick,
-        "Projected Runs": round(run_env, 2),
+        "Total EV": round(total_ev * 100, 2),
 
         "Spread Pick": spread_pick,
-        "Spread Margin": round(spread_margin, 2),
+        "Spread EV": round(spread_ev * 100, 2),
 
-        "Home Pitcher": home_pitcher,
-        "Away Pitcher": away_pitcher
+        "Team Total Pick": tt_pick,
+        "TT EV": round(tt_ev * 100, 2),
+
+        "Home Pitcher": g["home_pitcher"],
+        "Away Pitcher": g["away_pitcher"]
     })
-
-# ---------------- OUTPUT ---------------- #
 
 df = pd.DataFrame(results)
 
-st.subheader("📊 All Predictions (ML + Totals + Spreads)")
+st.subheader("📊 Predictions")
+st.dataframe(df, use_container_width=True)
 
-st.dataframe(df.sort_values("ML Win %", ascending=False), use_container_width=True)
+st.subheader("🪵 Tracker (Session Based)")
+st.dataframe(pd.DataFrame(st.session_state.tracker))
