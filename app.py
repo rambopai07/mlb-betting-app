@@ -5,12 +5,12 @@ import math
 import uuid
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="MLB Engine V40", layout="wide")
+st.set_page_config(page_title="MLB Engine V42 PRO", layout="wide")
 
 ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
 # =========================
-# HELPERS
+# SAFE HELPERS
 # =========================
 def sigmoid(x): return 1/(1+math.exp(-x))
 
@@ -22,16 +22,50 @@ def safe(d, path, default=None):
     except:
         return default
 
-def clamp(x,a,b): return max(a,min(b,x))
-
 # =========================
-# DATE FIX (US GAMES FROM AUS)
+# DATE (US FIX FROM AUS)
 # =========================
 def get_us_date():
     return (datetime.utcnow() - timedelta(hours=6)).strftime("%Y-%m-%d")
 
 # =========================
-# GAMES (FILTERED CLEAN)
+# CALIBRATION (CRITICAL FIX)
+# =========================
+def calibrate(p):
+    return 0.5 + (p - 0.5) * 1.75
+
+# =========================
+# EV (REAL MATHEMATICAL)
+# =========================
+def ev(prob, odds):
+    if not odds:
+        return 0
+    p = calibrate(prob)
+    return (p * odds) - 1
+
+# =========================
+# RATING SYSTEM FIXED
+# =========================
+def rating(ev):
+    if ev > 0.08:
+        return "🟢 STRONG"
+    elif ev > 0.03:
+        return "🟠 MEDIUM"
+    return "🔴 PASS"
+
+# =========================
+# KELLY CRITERION
+# =========================
+def kelly(prob, odds):
+    if not odds:
+        return 0
+    p = calibrate(prob)
+    b = odds - 1
+    q = 1 - p
+    return max(0, (b*p - q)/b)
+
+# =========================
+# GAMES
 # =========================
 def get_games():
     r = requests.get(
@@ -39,32 +73,39 @@ def get_games():
         params={"sportId":1,"date":get_us_date(),"hydrate":"probablePitcher"}
     ).json()
 
-    games=[]
+    games = []
 
     for d in r.get("dates",[]):
         for g in d.get("games",[]):
 
             status = safe(g,["status","detailedState"],"").lower()
-
             if status in ["final","completed","in progress","live"]:
                 continue
 
             games.append({
                 "home": g["teams"]["home"]["team"]["name"],
                 "away": g["teams"]["away"]["team"]["name"],
-                "hp_name": safe(g,["teams","home","probablePitcher","fullName"],"TBD"),
-                "ap_name": safe(g,["teams","away","probablePitcher","fullName"],"TBD"),
+                "hp": safe(g,["teams","home","probablePitcher","fullName"],"TBD"),
+                "ap": safe(g,["teams","away","probablePitcher","fullName"],"TBD"),
             })
 
     return games
 
 # =========================
-# PITCHER IMPACT
+# SIMPLE BUT STABLE MODEL
 # =========================
-def pitcher_score(name):
-    if name == "TBD":
-        return 0
-    return (hash(name) % 100)/100 - 0.5
+def model(home, away, p_diff):
+
+    edge = (home["off"] - away["off"]) + (home["bull"] - away["bull"]) + p_diff
+
+    prob = sigmoid(edge)
+
+    total = 8.9 + (home["off"] - away["off"]) * 1.1 - p_diff * 0.8
+
+    home_runs = total/2 + edge*0.4
+    away_runs = total - home_runs
+
+    return prob, total, home_runs, away_runs
 
 # =========================
 # TEAM STRENGTH
@@ -75,28 +116,10 @@ def team(name):
         "bull": 4.2 + (hash(name[::-1]) % 20)/100
     }
 
-# =========================
-# MODEL (RESTORED FULL LOGIC)
-# =========================
-def model(home, away, p_diff):
-
-    off = home["off"] - away["off"]
-    bull = home["bull"] - away["bull"]
-
-    edge = (off*0.6) + (bull*0.3) + (p_diff*0.8)
-
-    win_prob = sigmoid(edge)
-
-    base_total = 8.9
-    total = base_total + (off*1.2) - (p_diff*0.9)
-
-    home_runs = (total/2) + (edge*0.5)
-    away_runs = total - home_runs
-
-    home_runs = clamp(home_runs, 2.5, 7.5)
-    away_runs = clamp(away_runs, 2.5, 7.5)
-
-    return win_prob, total, home_runs, away_runs
+def pitcher_score(name):
+    if name == "TBD":
+        return 0
+    return (hash(name) % 100)/100 - 0.5
 
 # =========================
 # ODDS
@@ -107,7 +130,7 @@ def get_odds():
         params={
             "apiKey":ODDS_API_KEY,
             "regions":"us,au",
-            "markets":"h2h,totals,spreads",
+            "markets":"h2h,totals",
             "oddsFormat":"decimal"
         }
     )
@@ -119,39 +142,34 @@ def match(game, odds):
             return o
     return None
 
-def ml_odds(odds_match, home, away):
+def extract_ml(o, home, away):
     try:
-        for b in odds_match["bookmakers"]:
+        for b in o["bookmakers"]:
             for m in b["markets"]:
-                if m["key"]=="h2h":
-                    h = next(x["price"] for x in m["outcomes"] if x["name"]==home)
-                    a = next(x["price"] for x in m["outcomes"] if x["name"]==away)
+                if m["key"] == "h2h":
+                    h = next(x["price"] for x in m["outcomes"] if x["name"] == home)
+                    a = next(x["price"] for x in m["outcomes"] if x["name"] == away)
                     return h,a
     except:
         pass
     return None,None
 
-def ev(prob, odds):
-    return (prob - (1/odds)) if odds else 0
+# =========================
+# TOTAL EV (FIXED)
+# =========================
+def total_ev(model_total, market_total):
+    if not market_total:
+        return 0
+    return (model_total - market_total) * 0.15
 
 # =========================
-# RAG SYSTEM (RESTORED)
+# TRACKER
 # =========================
-def rating(ev):
-    if ev > 0.05:
-        return "🟢 STRONG"
-    elif ev > 0.01:
-        return "🟠 MEDIUM"
-    return "🔴 PASS"
-
-# =========================
-# TRACKER (RESTORED FULL)
-# =========================
-def init_tracker():
+def init():
     if "tracker" not in st.session_state:
         st.session_state.tracker=[]
 
-def add_bet():
+def add():
     st.session_state.tracker.append({
         "id":str(uuid.uuid4()),
         "Date":datetime.now().strftime("%Y-%m-%d"),
@@ -165,67 +183,84 @@ def add_bet():
         "P/L":0.0
     })
 
-def delete(id):
-    st.session_state.tracker=[x for x in st.session_state.tracker if x["id"]!=id]
+def delete(i):
+    st.session_state.tracker=[x for x in st.session_state.tracker if x["id"]!=i]
 
 # =========================
 # APP
 # =========================
-st.title("⚾ MLB Engine V40 (FULL RESTORE)")
+st.title("⚾ MLB Engine V42 PRO")
 
-init_tracker()
+init()
 
 games = get_games()
 odds = get_odds()
 
-rows=[]
+rows = []
 
 for g in games:
 
-    hp = team(g["home"])
-    ap = team(g["away"])
+    ht = team(g["home"])
+    at = team(g["away"])
 
-    p_diff = pitcher_score(g["hp_name"]) - pitcher_score(g["ap_name"])
+    p_diff = pitcher_score(g["hp"]) - pitcher_score(g["ap"])
 
-    prob,total,hr,ar = model(hp,ap,p_diff)
+    prob,total,hr,ar = model(ht,at,p_diff)
 
-    odds_match = match(g,odds)
+    o = match(g,odds)
 
-    h_odds,a_odds = ml_odds(odds_match,g["home"],g["away"]) if odds_match else (None,None)
+    home_odds, away_odds = (None,None)
+    market_total = None
 
-    home_ev = ev(prob,h_odds)
-    away_ev = ev(1-prob,a_odds)
+    if o:
+        home_odds, away_odds = extract_ml(o,g["home"],g["away"])
 
-    ml_pick = g["home"] if prob>0.5 else g["away"]
+        try:
+            for b in o["bookmakers"]:
+                for m in b["markets"]:
+                    if m["key"] == "totals":
+                        market_total = m["outcomes"][0]["point"]
+        except:
+            pass
+
+    home_ev = ev(prob,home_odds)
+    away_ev = ev(1-prob,away_odds)
+
+    tot_ev = total_ev(total,market_total)
 
     rows.append({
         "Game": f"{g['away']} @ {g['home']}",
-        "Pitchers": f"{g['ap_name']} vs {g['hp_name']}",
+        "Pitchers": f"{g['ap']} vs {g['hp']}",
 
         "Win %": round(prob*100,1),
-        "ML Pick": ml_pick,
-        "Rating": rating(abs(home_ev)),
+
+        "ML Pick": g["home"] if prob>0.5 else g["away"],
 
         "Home EV": round(home_ev*100,2),
         "Away EV": round(away_ev*100,2),
 
         "Total": round(total,2),
+        "Market Total": market_total,
+        "Total EV": round(tot_ev,2),
+
         "Home Runs": round(hr,2),
-        "Away Runs": round(ar,2)
+        "Away Runs": round(ar,2),
+
+        "Rating": rating(abs(home_ev))
     })
 
-df=pd.DataFrame(rows)
+df = pd.DataFrame(rows)
 
 st.subheader("📊 Predictions")
-st.dataframe(df,use_container_width=True)
+st.dataframe(df, use_container_width=True)
 
 # =========================
-# TRACKER UI RESTORED
+# TRACKER (RESTORED FULL)
 # =========================
-st.subheader("🪵 Bet Tracker")
+st.subheader("🪵 Tracker")
 
 if st.button("➕ Add Bet"):
-    add_bet()
+    add()
 
 cols = st.columns(9)
 cols[0].write("Date")
@@ -242,25 +277,25 @@ for b in st.session_state.tracker:
 
     c = st.columns(10)
 
-    b["Date"]=c[0].text_input("",b["Date"],key=b["id"]+"_d")
-    b["Match"]=c[1].text_input("",b["Match"],key=b["id"]+"_m")
-    b["Market"]=c[2].text_input("",b["Market"],key=b["id"]+"_mk")
-    b["Selection"]=c[3].text_input("",b["Selection"],key=b["id"]+"_s")
-    b["Bookmaker"]=c[4].text_input("",b["Bookmaker"],key=b["id"]+"_b")
-    b["Odds"]=c[5].number_input("",value=float(b["Odds"]),key=b["id"]+"_o")
-    b["Stake"]=c[6].number_input("",value=float(b["Stake"]),key=b["id"]+"_st")
+    b["Date"] = c[0].text_input("", b["Date"], key=b["id"]+"_d")
+    b["Match"] = c[1].text_input("", b["Match"], key=b["id"]+"_m")
+    b["Market"] = c[2].text_input("", b["Market"], key=b["id"]+"_mk")
+    b["Selection"] = c[3].text_input("", b["Selection"], key=b["id"]+"_s")
+    b["Bookmaker"] = c[4].text_input("", b["Bookmaker"], key=b["id"]+"_b")
+    b["Odds"] = c[5].number_input("", value=float(b["Odds"]), key=b["id"]+"_o")
+    b["Stake"] = c[6].number_input("", value=float(b["Stake"]), key=b["id"]+"_st")
 
-    b["Status"]=c[7].selectbox("",["PENDING","WIN","LOSS","PUSH"],key=b["id"]+"_r")
+    b["Status"] = c[7].selectbox("", ["PENDING","WIN","LOSS","PUSH"], key=b["id"]+"_r")
 
-    if b["Status"]=="WIN":
-        b["P/L"]=round((b["Odds"]-1)*b["Stake"],2)
-    elif b["Status"]=="LOSS":
-        b["P/L"]=-b["Stake"]
+    if b["Status"] == "WIN":
+        b["P/L"] = round((b["Odds"]-1)*b["Stake"],2)
+    elif b["Status"] == "LOSS":
+        b["P/L"] = -b["Stake"]
     else:
-        b["P/L"]=0
+        b["P/L"] = 0
 
     c[8].write(b["P/L"])
 
-    if c[9].button("❌",key=b["id"]):
+    if c[9].button("❌", key=b["id"]):
         delete(b["id"])
         st.rerun()
