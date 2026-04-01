@@ -3,28 +3,25 @@ import requests
 import pandas as pd
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="MLB Betting Engine V33", layout="wide")
+st.set_page_config(page_title="MLB Betting Engine V34", layout="wide")
 
 # =========================
-# 🔑 ODDS API KEY (RESTORED)
+# 🔑 API KEY
 # =========================
-
 ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
 # =========================
-# LEAGUE BASELINES
+# CONSTANTS
 # =========================
-
 LEAGUE_ERA = 4.35
 LEAGUE_K9 = 8.7
 LEAGUE_WHIP = 1.30
 
 # =========================
-# SAFE HELPERS
+# HELPERS
 # =========================
-
 def sigmoid(x):
     return 1 / (1 + math.exp(-x))
 
@@ -47,22 +44,32 @@ def safe(d, path, default=None):
         return default
 
 # =========================
-# MLB GAMES (FILTERED)
+# 🌍 TIMEZONE FIX (AUS → US)
 # =========================
+def get_us_date():
+    now_utc = datetime.utcnow()
+    # shift back ~6h to align with US schedule
+    adjusted = now_utc - timedelta(hours=6)
+    return adjusted.strftime("%Y-%m-%d")
 
+# =========================
+# GAMES
+# =========================
 def get_games():
+
+    date = get_us_date()
 
     url = "https://statsapi.mlb.com/api/v1/schedule"
 
     data = requests.get(url, params={
         "sportId": 1,
+        "date": date,
         "hydrate": "probablePitcher"
     }).json()
 
     games = []
 
     for d in data.get("dates", []):
-
         for g in d.get("games", []):
 
             status = safe(g, ["status", "detailedState"], "").lower()
@@ -80,17 +87,12 @@ def get_games():
     return games
 
 # =========================
-# REAL PITCHER STATS
+# PITCHERS
 # =========================
-
 def get_pitcher_stats(pid):
 
     if not pid:
-        return {
-            "era": LEAGUE_ERA,
-            "whip": LEAGUE_WHIP,
-            "k9": LEAGUE_K9
-        }
+        return {"era": LEAGUE_ERA, "whip": LEAGUE_WHIP, "k9": LEAGUE_K9}
 
     url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
 
@@ -104,19 +106,21 @@ def get_pitcher_stats(pid):
         "k9": float(stat.get("strikeoutsPer9Inn", LEAGUE_K9) or LEAGUE_K9)
     }
 
-# =========================
-# TEAM MODEL
-# =========================
+def pitcher_score(p):
+    return (
+        (LEAGUE_ERA - p["era"]) * 0.5 +
+        (p["k9"] - LEAGUE_K9) * 0.3 +
+        (LEAGUE_WHIP - p["whip"]) * 0.2
+    )
 
+# =========================
+# TEAMS
+# =========================
 def get_teams():
-
-    url = "https://statsapi.mlb.com/api/v1/teams?sportId=1"
-    data = requests.get(url).json()
+    data = requests.get("https://statsapi.mlb.com/api/v1/teams?sportId=1").json()
 
     teams = {}
-
     for t in data.get("teams", []):
-
         teams[t["name"]] = {
             "off": 4.3 + (hash(t["name"]) % 30) / 100,
             "bull": 4.2 + (hash(t["name"][::-1]) % 25) / 100
@@ -125,74 +129,58 @@ def get_teams():
     return teams
 
 # =========================
-# PITCHER IMPACT
+# ODDS
 # =========================
-
-def pitcher_score(p):
-
-    era_edge = LEAGUE_ERA - p["era"]
-    k_edge = p["k9"] - LEAGUE_K9
-    whip_edge = LEAGUE_WHIP - p["whip"]
-
-    return (era_edge * 0.5) + (k_edge * 0.3) + (whip_edge * 0.2)
-
-# =========================
-# ODDS API
-# =========================
-
 def get_odds():
 
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
-
-    r = requests.get(url, params={
-        "apiKey": ODDS_API_KEY,
-        "regions": "us,au",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "decimal"
-    })
+    r = requests.get(
+        "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/",
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us,au",
+            "markets": "h2h,spreads,totals",
+            "oddsFormat": "decimal"
+        }
+    )
 
     if r.status_code != 200:
         return []
 
     return r.json()
 
-def find_odds(game, odds_data):
-
-    for o in odds_data:
-
+def match_odds(game, odds):
+    for o in odds:
         if game["home"] in o.get("home_team", "") and game["away"] in o.get("away_team", ""):
             return o
-
     return None
 
 # =========================
 # MODEL
 # =========================
-
 def model(home, away, ht, at, p_diff):
 
     off = ht["off"] - at["off"]
     bull = ht["bull"] - at["bull"]
 
-    edge = (
-        0.30 * off +
-        0.25 * p_diff +
-        0.20 * bull +
-        0.25 * 0.15
-    )
+    edge = (0.30*off + 0.25*p_diff + 0.20*bull + 0.25*0.15)
 
-    win_prob = sigmoid(edge)
-
-    run_env = 8.6 + (off * 2.0) - (p_diff * 1.5)
-
+    prob = sigmoid(edge)
+    runs = 8.6 + (off*2.0) - (p_diff*1.5)
     spread = edge * 2.2
 
-    return clamp(win_prob, 0.05, 0.85), run_env, spread
+    return clamp(prob, 0.05, 0.85), runs, spread
+
+def implied_prob(o):
+    return 1/o if o else 0
+
+def calc_ev(p, odds):
+    if not odds:
+        return 0
+    return p - implied_prob(odds)
 
 # =========================
 # TRACKER
 # =========================
-
 def init_tracker():
     if "tracker" not in st.session_state:
         st.session_state.tracker = []
@@ -200,7 +188,6 @@ def init_tracker():
 def add_bet(b):
     b["id"] = str(uuid.uuid4())
     b["result"] = "PENDING"
-    b["created"] = datetime.now().isoformat()
     st.session_state.tracker.append(b)
 
 def delete_bet(bid):
@@ -210,7 +197,7 @@ def delete_bet(bid):
 # APP
 # =========================
 
-st.title("⚾ MLB Betting Engine V33 — FULL SYSTEM")
+st.title("⚾ MLB Betting Engine V34")
 
 init_tracker()
 
@@ -227,26 +214,30 @@ for g in games:
 
     p_diff = pitcher_score(hp) - pitcher_score(ap)
 
-    ht = teams.get(g["home"], {"off": 4.3, "bull": 4.2})
-    at = teams.get(g["away"], {"off": 4.3, "bull": 4.2})
+    ht = teams.get(g["home"], {"off":4.3,"bull":4.2})
+    at = teams.get(g["away"], {"off":4.3,"bull":4.2})
 
-    prob, run_env, spread = model(g["home"], g["away"], ht, at, p_diff)
+    prob, runs, spread = model(g["home"], g["away"], ht, at, p_diff)
 
-    ml_pick = g["home"] if prob > 0.5 else g["away"]
+    odds_match = match_odds(g, odds)
 
-    ev_ml = abs(prob - 0.5) * 2
-    ev_total = abs(run_env - 8.5) * 0.04
-    ev_spread = abs(spread) * 0.03
+    ml_odds = None
+    if odds_match:
+        try:
+            ml_odds = odds_match["bookmakers"][0]["markets"][0]["outcomes"][0]["price"]
+        except:
+            pass
+
+    ev_ml = calc_ev(prob, ml_odds)
 
     rows.append({
         "Game": f"{g['away']} @ {g['home']}",
-        "ML Pick": ml_pick,
-        "ML EV": round(ev_ml * 100, 2),
-        "Total Pick": "OVER" if run_env > 8.5 else "UNDER",
-        "Total EV": round(ev_total * 100, 2),
-        "Spread Pick": g["home"] if spread > 0 else g["away"],
-        "Spread EV": round(ev_spread * 100, 2),
-        "Pitchers": f"{ap} @ {hp}",
+        "ML Pick": g["home"] if prob > 0.5 else g["away"],
+        "Win %": round(prob*100,1),
+        "EV %": round(ev_ml*100,2),
+        "Runs": round(runs,2),
+        "Spread": round(spread,2),
+        "Pitchers": f"{hp} vs {ap}",
         "Rating": rating(ev_ml)
     })
 
@@ -256,30 +247,29 @@ df = pd.DataFrame(rows)
 # OUTPUT
 # =========================
 
-st.subheader("📊 Predictions (ALL FACTORS INCLUDED)")
+st.subheader("📊 Predictions")
 
-st.dataframe(df, use_container_width=True)
+if df.empty:
+    st.warning("No games found — check API timing")
+else:
+    st.dataframe(df, use_container_width=True)
 
 # =========================
-# TRACKER
+# TRACKER SAFE
 # =========================
 
 st.subheader("🪵 Tracker")
 
-game = st.selectbox("Select Game", df["Game"])
+if df.empty:
+    st.warning("No games available for tracking")
+else:
 
-if st.button("➕ Add to Tracker"):
+    game = st.selectbox("Select Game", df["Game"])
 
-    row = df[df["Game"] == game].iloc[0]
-
-    add_bet({
-        "Game": row["Game"],
-        "Pick": row["ML Pick"],
-        "EV": row["ML EV"],
-        "Rating": row["Rating"]
-    })
-
-    st.success("Added to tracker")
+    if st.button("➕ Add Bet"):
+        row = df[df["Game"] == game].iloc[0]
+        add_bet(row.to_dict())
+        st.success("Added")
 
 for b in st.session_state.tracker:
 
@@ -289,12 +279,12 @@ for b in st.session_state.tracker:
         st.write(b["Game"])
 
     with c2:
-        st.write(b["Pick"])
+        st.write(b["ML Pick"])
 
     with c3:
         b["result"] = st.selectbox(
             "Result",
-            ["PENDING", "WIN", "LOSS", "PUSH"],
+            ["PENDING","WIN","LOSS","PUSH"],
             key=b["id"]
         )
 
