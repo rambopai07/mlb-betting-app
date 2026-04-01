@@ -5,16 +5,10 @@ import math
 import uuid
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="MLB Betting Engine V37 SHARP", layout="wide")
+st.set_page_config(page_title="MLB Betting Engine V38", layout="wide")
 
-# =========================
-# 🔑 API KEY
-# =========================
 ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
-# =========================
-# CONSTANTS
-# =========================
 LEAGUE_ERA = 4.35
 LEAGUE_K9 = 8.7
 LEAGUE_WHIP = 1.30
@@ -25,11 +19,6 @@ LEAGUE_WHIP = 1.30
 def sigmoid(x): return 1/(1+math.exp(-x))
 def clamp(x,a,b): return max(a,min(b,x))
 
-def rating(ev):
-    if ev >= 0.6: return "🟢 STRONG"
-    elif ev >= 0.3: return "🟠 MEDIUM"
-    return "🔴 PASS"
-
 def safe(d,path,default=None):
     try:
         for p in path: d=d[p]
@@ -37,7 +26,7 @@ def safe(d,path,default=None):
     except: return default
 
 # =========================
-# 🌍 TIMEZONE FIX
+# DATE FIX
 # =========================
 def get_us_date():
     return (datetime.utcnow()-timedelta(hours=6)).strftime("%Y-%m-%d")
@@ -108,7 +97,7 @@ def get_teams():
     return teams
 
 # =========================
-# ODDS
+# ODDS FIXED
 # =========================
 def get_odds():
     r = requests.get(
@@ -122,40 +111,32 @@ def get_odds():
     )
     return r.json() if r.status_code==200 else []
 
-def match_odds(game,odds):
+def extract_ml_odds(odds_match, home, away):
+    try:
+        outcomes = odds_match["bookmakers"][0]["markets"][0]["outcomes"]
+        home_odds = next(o["price"] for o in outcomes if o["name"] == home)
+        away_odds = next(o["price"] for o in outcomes if o["name"] == away)
+        return home_odds, away_odds
+    except:
+        return None, None
+
+def extract_total_spread(odds_match):
+    try:
+        markets = odds_match["bookmakers"][0]["markets"]
+        total = next(m for m in markets if m["key"]=="totals")
+        spread = next(m for m in markets if m["key"]=="spreads")
+        return total["outcomes"][0]["point"], spread["outcomes"][0]["point"]
+    except:
+        return None, None
+
+def match_odds(game, odds):
     for o in odds:
         if game["home"] in o.get("home_team","") and game["away"] in o.get("away_team",""):
             return o
     return None
 
 # =========================
-# MARKET TEAM TOTALS
-# =========================
-def extract_market_lines(odds_match):
-    try:
-        markets = odds_match["bookmakers"][0]["markets"]
-
-        total = next(m for m in markets if m["key"]=="totals")
-        spread = next(m for m in markets if m["key"]=="spreads")
-
-        total_line = total["outcomes"][0]["point"]
-        spread_line = spread["outcomes"][0]["point"]
-
-        return total_line, spread_line
-    except:
-        return None, None
-
-def derive_team_totals(total, spread):
-    if total is None or spread is None:
-        return None, None
-
-    home_tt = (total/2) + (spread/2)
-    away_tt = total - home_tt
-
-    return home_tt, away_tt
-
-# =========================
-# MODEL
+# MODEL FIXED
 # =========================
 def model(ht,at,p_diff):
 
@@ -165,17 +146,23 @@ def model(ht,at,p_diff):
     edge = (0.30*off + 0.25*p_diff + 0.20*bull + 0.25*0.15)
 
     prob = sigmoid(edge)
-    total = 8.6 + (off*2.0) - (p_diff*1.5)
+    total = 8.6 + (off*2.2) - (p_diff*1.3)
 
-    home_runs = clamp((total/2)+(edge*0.8),2.0,7.5)
-    away_runs = clamp(total-home_runs,2.0,7.5)
+    home_runs = (total/2)+(edge*0.6)
+    away_runs = total-home_runs
 
-    spread = edge*2.2
+    home_runs = clamp(home_runs,3.0,7.0)
+    away_runs = clamp(away_runs,3.0,7.0)
+
+    spread = edge*2.0
 
     return prob,total,spread,home_runs,away_runs
 
+def implied_prob(o): return 1/o if o else 0
+def calc_ev(p,o): return p - implied_prob(o) if o else 0
+
 # =========================
-# TRACKER
+# TRACKER FIXED
 # =========================
 def init_tracker():
     if "tracker" not in st.session_state:
@@ -196,7 +183,7 @@ def delete_bet(bid):
 # =========================
 # APP
 # =========================
-st.title("⚾ MLB Betting Engine V37 SHARP")
+st.title("⚾ MLB Betting Engine V38 (STABLE)")
 
 init_tracker()
 
@@ -216,54 +203,45 @@ for g in games:
     ht = teams.get(g["home"],{"off":4.3,"bull":4.2})
     at = teams.get(g["away"],{"off":4.3,"bull":4.2})
 
-    prob,total,spread,home_model_tt,away_model_tt = model(ht,at,p_diff)
+    prob,total,spread,home_tt,away_tt = model(ht,at,p_diff)
 
     odds_match = match_odds(g,odds)
 
-    market_total, market_spread = extract_market_lines(odds_match) if odds_match else (None,None)
-    home_market_tt, away_market_tt = derive_team_totals(market_total, market_spread)
+    home_odds, away_odds = extract_ml_odds(odds_match,g["home"],g["away"]) if odds_match else (None,None)
 
-    home_ev = (home_model_tt - home_market_tt) if home_market_tt else 0
-    away_ev = (away_model_tt - away_market_tt) if away_market_tt else 0
+    ev_home = calc_ev(prob, home_odds)
+    ev_away = calc_ev(1-prob, away_odds)
 
     rows.append({
         "Game":f"{g['away']} @ {g['home']}",
         "Pitchers":f"{g['ap_name']} vs {g['hp_name']}",
-
         "Win %":round(prob*100,1),
-        "ML Pick": g["home"] if prob>0.5 else g["away"],
-
-        "Market Total":market_total,
-
-        "Home TT Model":round(home_model_tt,2),
-        "Home TT Market":round(home_market_tt,2) if home_market_tt else None,
-        "Home TT EV":round(home_ev,2),
-        "Home TT Pick":"OVER" if home_ev>0.3 else "UNDER" if home_ev<-0.3 else "PASS",
-
-        "Away TT Model":round(away_model_tt,2),
-        "Away TT Market":round(away_market_tt,2) if away_market_tt else None,
-        "Away TT EV":round(away_ev,2),
-        "Away TT Pick":"OVER" if away_ev>0.3 else "UNDER" if away_ev<-0.3 else "PASS",
-
-        "Rating":rating(abs(prob-0.5))
+        "Home EV %":round(ev_home*100,2) if ev_home else None,
+        "Away EV %":round(ev_away*100,2) if ev_away else None,
+        "Home TT":round(home_tt,2),
+        "Away TT":round(away_tt,2)
     })
 
-df = pd.DataFrame(rows)
+df=pd.DataFrame(rows)
 
-# =========================
-# OUTPUT
-# =========================
 st.subheader("📊 Betting Board")
-
-if df.empty:
-    st.warning("No games today")
-else:
-    st.dataframe(df,use_container_width=True)
+st.dataframe(df,use_container_width=True)
 
 # =========================
-# TRACKER
+# TRACKER UI
 # =========================
 st.subheader("🪵 Bet Tracker")
+
+header = st.columns(10)
+header[0].write("Date")
+header[1].write("Match")
+header[2].write("Market")
+header[3].write("Selection")
+header[4].write("Book")
+header[5].write("Odds")
+header[6].write("Stake")
+header[7].write("Status")
+header[8].write("P/L")
 
 if st.button("➕ Add Bet"):
     add_blank_bet()
@@ -272,18 +250,15 @@ for b in st.session_state.tracker:
 
     cols = st.columns(10)
 
-    b["Date"] = cols[0].text_input("Date",b["Date"],key=f"d_{b['id']}")
-    b["Match"] = cols[1].text_input("Match",b["Match"],key=f"m_{b['id']}")
-    b["Market"] = cols[2].text_input("Market",b["Market"],key=f"mk_{b['id']}")
-    b["Selection"] = cols[3].text_input("Selection",b["Selection"],key=f"s_{b['id']}")
-    b["Bookmaker"] = cols[4].text_input("Book",b["Bookmaker"],key=f"bk_{b['id']}")
-    b["Odds"] = cols[5].number_input("Odds",value=float(b["Odds"]),key=f"o_{b['id']}")
-    b["Stake"] = cols[6].number_input("Stake",value=float(b["Stake"]),key=f"st_{b['id']}")
+    b["Date"] = cols[0].text_input("",b["Date"],key=f"d_{b['id']}")
+    b["Match"] = cols[1].text_input("",b["Match"],key=f"m_{b['id']}")
+    b["Market"] = cols[2].text_input("",b["Market"],key=f"mk_{b['id']}")
+    b["Selection"] = cols[3].text_input("",b["Selection"],key=f"s_{b['id']}")
+    b["Bookmaker"] = cols[4].text_input("",b["Bookmaker"],key=f"bk_{b['id']}")
+    b["Odds"] = cols[5].number_input("",value=float(b["Odds"]),key=f"o_{b['id']}")
+    b["Stake"] = cols[6].number_input("",value=float(b["Stake"]),key=f"st_{b['id']}")
 
-    b["Status"] = cols[7].selectbox(
-        "Status",["PENDING","WIN","LOSS","PUSH"],
-        key=f"res_{b['id']}"
-    )
+    b["Status"] = cols[7].selectbox("",["PENDING","WIN","LOSS","PUSH"],key=f"res_{b['id']}")
 
     if b["Status"]=="WIN":
         b["P/L"] = round((b["Odds"]-1)*b["Stake"],2)
