@@ -5,12 +5,16 @@ import requests
 from datetime import datetime
 
 st.set_page_config(layout="wide")
-st.title("⚾ MLB Model (DEBUG + FINAL STABLE)")
+st.title("⚾ MLB Betting Model V10 — Production Grade (Real Stats)")
+
+# =========================
+# CONFIG
+# =========================
 
 ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
 # =========================
-# SAFE REQUEST
+# SAFE API CALL
 # =========================
 
 def safe_get(url):
@@ -23,13 +27,13 @@ def safe_get(url):
         return {}
 
 # =========================
-# GET GAMES + PITCHERS
+# MLB GAMES
 # =========================
 
 def get_games():
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher,team"
     data = safe_get(url)
 
     games = []
@@ -37,32 +41,78 @@ def get_games():
     for d in data.get("dates", []):
         for g in d.get("games", []):
 
-            home_pitch = g["teams"]["home"].get("probablePitcher", {})
-            away_pitch = g["teams"]["away"].get("probablePitcher", {})
-
             games.append({
-                "home": g["teams"]["home"]["team"]["name"],
-                "away": g["teams"]["away"]["team"]["name"],
-                "home_pitcher": home_pitch.get("fullName", "TBD"),
-                "away_pitcher": away_pitch.get("fullName", "TBD")
+                "home_team": g["teams"]["home"]["team"]["name"],
+                "away_team": g["teams"]["away"]["team"]["name"],
+                "home_id": g["teams"]["home"]["team"]["id"],
+                "away_id": g["teams"]["away"]["team"]["id"],
+                "home_pitcher_id": g["teams"]["home"].get("probablePitcher", {}).get("id"),
+                "away_pitcher_id": g["teams"]["away"].get("probablePitcher", {}).get("id"),
+                "home_pitcher_name": g["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD"),
+                "away_pitcher_name": g["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD"),
             })
 
     return games
 
 # =========================
-# SIMPLE RELIABLE PITCHER MODEL
-# (NO BROKEN ENDPOINTS)
+# PITCHER STATS (REAL MLB API)
 # =========================
 
-def pitcher_score(name):
-    # deterministic proxy (until Statcast upgrade)
-    return hash(name) % 100 / 100
+def pitcher_stats(pid):
+
+    if pid is None:
+        return {"era": 4.2, "bb": 3.0, "so": 6.0}
+
+    url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=pitching"
+    data = safe_get(url)
+
+    try:
+        s = data["stats"][0]["splits"][0]["stat"]
+
+        era = float(s.get("era", 4.2))
+        bb = float(s.get("baseOnBalls", 30))
+        so = float(s.get("strikeOuts", 80))
+
+        return {
+            "era": era,
+            "bb": bb,
+            "so": so
+        }
+
+    except:
+        return {"era": 4.2, "bb": 3.0, "so": 6.0}
 
 # =========================
-# ODDS (SAFE FALLBACK)
+# TEAM OFFENSE STATS (REAL)
+# =========================
+
+def team_stats(team_id):
+
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season"
+    data = safe_get(url)
+
+    try:
+        s = data["stats"][0]["splits"][0]["stat"]
+
+        return {
+            "runs": float(s.get("runs", 700)),
+            "obp": float(s.get("obp", 0.320)),
+            "slg": float(s.get("slg", 0.400)),
+        }
+
+    except:
+        return {
+            "runs": 700,
+            "obp": 0.320,
+            "slg": 0.400
+        }
+
+# =========================
+# ODDS
 # =========================
 
 def get_odds():
+
     if ODDS_API_KEY == "0d678e13097a84442df1e953f8fcaf95":
         return {}
 
@@ -84,16 +134,35 @@ def get_odds():
     return odds
 
 # =========================
+# FEATURE ENGINE
+# =========================
+
+def pitcher_strength(p):
+    return (p["so"] / max(p["bb"], 1)) - (p["era"] / 5)
+
+def offense_strength(t):
+    return (t["runs"] / 1000) + t["obp"] + t["slg"]
+
+# =========================
 # MODEL
 # =========================
 
-def predict(home_p, away_p):
+def predict(home_team, away_team, home_p, away_p, home_t, away_t):
 
-    h = pitcher_score(home_p)
-    a = pitcher_score(away_p)
+    home_pitch = pitcher_strength(home_p)
+    away_pitch = pitcher_strength(away_p)
 
-    diff = h - a
-    prob_home = 1 / (1 + np.exp(-diff * 3))
+    home_off = offense_strength(home_t)
+    away_off = offense_strength(away_t)
+
+    home_adv = 0.15
+
+    home_score = (home_pitch * 0.6) + (home_off * 0.4) + home_adv
+    away_score = (away_pitch * 0.6) + (away_off * 0.4)
+
+    diff = home_score - away_score
+
+    prob_home = 1 / (1 + np.exp(-4.5 * diff))
 
     return prob_home
 
@@ -101,7 +170,7 @@ def predict(home_p, away_p):
 # RUN
 # =========================
 
-st.write("Loading games...")
+st.write("Loading MLB games...")
 
 games = get_games()
 
@@ -116,23 +185,36 @@ results = []
 
 for g in games:
 
-    prob = predict(g["home_pitcher"], g["away_pitcher"])
+    home_p = pitcher_stats(g["home_pitcher_id"])
+    away_p = pitcher_stats(g["away_pitcher_id"])
 
-    odds = odds_map.get(g["home"], 1.90)
+    home_t = team_stats(g["home_id"])
+    away_t = team_stats(g["away_id"])
+
+    prob = predict(
+        g["home_team"],
+        g["away_team"],
+        home_p,
+        away_p,
+        home_t,
+        away_t
+    )
+
+    odds = odds_map.get(g["home_team"], 1.90)
+
     implied = 1 / odds
-
     edge = prob - implied
 
     bet = None
     if edge > 0.05:
-        bet = "HOME"
+        bet = "HOME ML"
     elif edge < -0.05:
-        bet = "AWAY"
+        bet = "AWAY ML"
 
     results.append({
-        "Game": f'{g["away"]} @ {g["home"]}',
-        "Away Pitcher": g["away_pitcher"],
-        "Home Pitcher": g["home_pitcher"],
+        "Game": f'{g["away_team"]} @ {g["home_team"]}',
+        "Home Pitcher": g["home_pitcher_name"],
+        "Away Pitcher": g["away_pitcher_name"],
         "Win Prob %": round(prob * 100, 1),
         "Odds": odds,
         "Edge %": round(edge * 100, 1),
@@ -141,7 +223,7 @@ for g in games:
 
 df = pd.DataFrame(results)
 
-st.subheader("📊 Games + Pitchers")
+st.subheader("📊 Full Model Results")
 st.dataframe(df, use_container_width=True)
 
 st.subheader("🔥 Value Bets")
