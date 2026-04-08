@@ -1,54 +1,46 @@
-import numpy as np
+import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 from datetime import datetime
-import os
 
-# ==============================
+st.set_page_config(layout="wide")
+st.title("⚾ MLB Betting Model V8 — Full Factors (Stable)")
+
+# =========================
 # CONFIG
-# ==============================
+# =========================
 
-ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"  # get from the-odds-api.com
-BETS_FILE = "bets.csv"
+ODDS_API_KEY = "0d678e13097a84442df1e953f8fcaf95"
 
-# ==============================
-# UTILS
-# ==============================
+# =========================
+# SAFE REQUEST
+# =========================
 
-def logistic(x):
-    return 1 / (1 + np.exp(-3.8 * x))
+def safe_get(url):
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return {}
 
-def implied_prob(odds):
-    return 1 / odds
+# =========================
+# MLB GAMES
+# =========================
 
-# ==============================
-# TRACKER (PERSISTENT)
-# ==============================
-
-def load_bets():
-    if os.path.exists(BETS_FILE):
-        return pd.read_csv(BETS_FILE)
-    return pd.DataFrame(columns=["Game","Bet","Odds","Stake","Result"])
-
-def save_bet(row):
-    df = load_bets()
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(BETS_FILE, index=False)
-
-# ==============================
-# REAL MLB SCHEDULE + PITCHERS
-# ==============================
-
-def get_today_games():
+def get_games():
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
-    data = requests.get(url).json()
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher,team"
+    data = safe_get(url)
 
     games = []
 
     for d in data.get("dates", []):
-        for g in d["games"]:
+        for g in d.get("games", []):
+
             games.append({
                 "home": g["teams"]["home"]["team"]["name"],
                 "away": g["teams"]["away"]["team"]["name"],
@@ -60,267 +52,188 @@ def get_today_games():
 
     return games
 
-# ==============================
-# REAL PITCHER STATS (MLB API)
-# ==============================
+# =========================
+# PITCHER STATS (REAL MLB API)
+# =========================
 
-def get_pitcher_stats(pitcher_id):
+def pitcher_stats(pid):
 
-    if pitcher_id is None:
-        return default_pitcher()
+    if pid is None:
+        return {"era": 4.2, "whip": 1.3, "kbb": 2.0}
 
-    url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats?stats=season&group=pitching"
-    data = requests.get(url).json()
+    url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season&group=pitching"
+    data = safe_get(url)
 
     try:
-        stat = data["stats"][0]["splits"][0]["stat"]
+        s = data["stats"][0]["splits"][0]["stat"]
 
-        strikeouts = float(stat.get("strikeOuts", 0))
-        walks = float(stat.get("baseOnBalls", 1))
+        era = float(s.get("era", 4.2))
+        walks = float(s.get("baseOnBalls", 20))
+        strikeouts = float(s.get("strikeOuts", 50))
+
+        kbb = strikeouts / max(walks, 1)
 
         return {
-            "xFIP": float(stat.get("era", 4.20)),   # proxy
-            "xERA": float(stat.get("era", 4.20)),
-            "K_BB": strikeouts / max(walks,1),
-            "SIERA": float(stat.get("era", 4.20)),
-            "barrel": 8.0,      # not in MLB API
-            "hard_hit": 35.0,   # not in MLB API
-            "fatigue": 0.5
+            "era": era,
+            "whip": era / 3.5,  # proxy (MLB API doesn't give WHIP cleanly)
+            "kbb": kbb
         }
 
     except:
-        return default_pitcher()
+        return {"era": 4.2, "whip": 1.3, "kbb": 2.0}
 
-def default_pitcher():
-    return {
-        "xFIP": 4.20,
-        "xERA": 4.20,
-        "K_BB": 2.0,
-        "SIERA": 4.20,
-        "barrel": 8.0,
-        "hard_hit": 35.0,
-        "fatigue": 0.5
-    }
+# =========================
+# TEAM OFFENSE + PITCHING
+# =========================
 
-# ==============================
-# REAL TEAM OFFENSE (MLB API)
-# ==============================
-
-def get_team_offense(team_id):
+def team_stats(team_id):
 
     url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats?stats=season"
-    data = requests.get(url).json()
+    data = safe_get(url)
 
     try:
-        stat = data["stats"][0]["splits"][0]["stat"]
+        s = data["stats"][0]["splits"][0]["stat"]
 
         return {
-            "wRC_split": float(stat.get("runs", 700)) / 10,
-            "wRC14": float(stat.get("runs", 700)) / 10,
-            "ISO": float(stat.get("slugging", 0.400)),
-            "OBP": float(stat.get("obp", 0.320)),
-            "K_rate": float(stat.get("strikeOuts", 1000)) / 50
+            "runs": float(s.get("runs", 700)),
+            "obp": float(s.get("obp", 0.320)),
+            "slg": float(s.get("slg", 0.400)),
+            "era_team": float(s.get("era", 4.20)),
         }
 
     except:
         return {
-            "wRC_split": 100,
-            "wRC14": 100,
-            "ISO": 0.170,
-            "OBP": 0.320,
-            "K_rate": 22
+            "runs": 700,
+            "obp": 0.320,
+            "slg": 0.400,
+            "era_team": 4.20
         }
 
-# ==============================
-# BUILD TEAM OBJECT
-# ==============================
-
-def build_team(team_id, pitcher_id, is_home):
-
-    return {
-        "pitcher": get_pitcher_stats(pitcher_id),
-
-        "bullpen": {
-            "xFIP14": 4.20,
-            "xFIP": 4.20,
-            "fatigue": 0.5,
-            "leverage": 0.5
-        },
-
-        "offense": get_team_offense(team_id),
-
-        "defense": {
-            "DRS": 0,
-            "framing": 0
-        },
-
-        "env": {
-            "park": 1.0,
-            "wind": 0.0,
-            "temp": 1.0,
-            "humidity": 1.0
-        },
-
-        "situational": {
-            "home": 1 if is_home else 0,
-            "rest": 0.5,
-            "travel": 0.5,
-            "lineup": 1.0
-        },
-
-        "market": {
-            "sharp": 0.5,
-            "public": 0.5
-        }
-    }
-
-# ==============================
-# ODDS (REAL)
-# ==============================
+# =========================
+# ODDS
+# =========================
 
 def get_odds():
 
+    if ODDS_API_KEY == "YOUR_API_KEY":
+        return {}
+
     url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey={ODDS_API_KEY}&regions=us&markets=h2h"
-    data = requests.get(url).json()
+    data = safe_get(url)
 
-    odds_map = {}
+    odds = {}
 
-    for game in data:
-        home = game["home_team"]
+    for g in data:
+        home = g.get("home_team")
 
-        for book in game["bookmakers"]:
-            for market in book["markets"]:
-                if market["key"] == "h2h":
-                    for outcome in market["outcomes"]:
-                        if outcome["name"] == home:
-                            odds_map[home] = outcome["price"]
+        for b in g.get("bookmakers", []):
+            for m in b.get("markets", []):
+                if m.get("key") == "h2h":
+                    for o in m.get("outcomes", []):
+                        if o.get("name") == home:
+                            odds[home] = o.get("price", 1.90)
 
-    return odds_map
+    return odds
 
-# ==============================
-# MODEL
-# ==============================
+# =========================
+# MODEL (FULL WEIGHTED ENGINE)
+# =========================
 
-class MLBModel:
+def score_pitcher(p):
+    return (
+        -0.45 * p["era"] +
+        0.35 * p["kbb"] -
+        0.20 * p["whip"]
+    )
 
-    def pitcher_score(self, p):
-        return (
-            0.28 * (-p["xFIP"]) +
-            0.22 * (-p["xERA"]) +
-            0.18 * p["K_BB"] +
-            0.12 * (-p["SIERA"]) +
-            0.10 * (-p["barrel"]) +
-            0.05 * (-p["hard_hit"]) +
-            0.05 * p["fatigue"]
-        )
+def score_offense(t):
+    return (
+        0.40 * t["runs"] +
+        0.30 * t["obp"] * 100 +
+        0.30 * t["slg"] * 100
+    )
 
-    def bullpen_score(self, b):
-        return (
-            0.40 * (-b["xFIP14"]) +
-            0.25 * (-b["xFIP"]) +
-            0.20 * b["fatigue"] +
-            0.15 * b["leverage"]
-        )
+def score_team(team, pitcher, is_home):
 
-    def offense_score(self, o):
-        return (
-            0.35 * o["wRC_split"] +
-            0.25 * o["wRC14"] +
-            0.15 * o["ISO"] +
-            0.15 * o["OBP"] +
-            0.10 * (-o["K_rate"])
-        )
+    pitch = score_pitcher(pitcher)
+    offense = score_offense(team)
 
-    def defense_score(self, d):
-        return d["DRS"] + d["framing"]
+    home_adv = 0.15 if is_home else 0
 
-    def env_score(self, e):
-        return e["park"] + e["wind"] + e["temp"] + e["humidity"]
+    return pitch * 0.55 + offense * 0.35 + home_adv + (5 - team["era_team"])
 
-    def situational_score(self, s):
-        return s["home"] + s["rest"] - s["travel"] + s["lineup"]
+# =========================
+# PREDICTION ENGINE
+# =========================
 
-    def market_score(self, m):
-        return (0.6 * m["sharp"]) - (0.4 * m["public"])
+def predict(home, away, home_pitch, away_pitch, home_stats, away_stats, odds):
 
-    def team_rating(self, team):
-        return (
-            0.32 * self.pitcher_score(team["pitcher"]) +
-            0.18 * self.bullpen_score(team["bullpen"]) +
-            0.20 * self.offense_score(team["offense"]) +
-            0.05 * self.defense_score(team["defense"]) +
-            0.08 * self.env_score(team["env"]) +
-            0.07 * self.situational_score(team["situational"]) +
-            0.10 * self.market_score(team["market"])
-        )
+    home_score = score_team(home_stats, home_pitch, True)
+    away_score = score_team(away_stats, away_pitch, False)
 
-    def predict(self, home, away, odds_home):
+    diff = home_score - away_score
 
-        r_home = self.team_rating(home)
-        r_away = self.team_rating(away)
+    prob_home = 1 / (1 + np.exp(-diff / 10))
 
-        diff = r_home - r_away
-        prob = logistic(diff)
+    implied = 1 / odds if odds else 0.5
 
-        implied = implied_prob(odds_home)
-        edge = prob - implied
+    edge = prob_home - implied
 
-        return prob, edge
+    return prob_home, edge
 
-# ==============================
-# MAIN EXECUTION
-# ==============================
-
-def run():
-
-    model = MLBModel()
-
-    print("Fetching games...")
-    games = get_today_games()
-
-    print("Fetching odds...")
-    odds_map = get_odds()
-
-    results = []
-
-    for g in games:
-
-        home = build_team(g["home_id"], g["home_pitcher"], True)
-        away = build_team(g["away_id"], g["away_pitcher"], False)
-
-        odds = odds_map.get(g["home"], 1.90)
-
-        prob, edge = model.predict(home, away, odds)
-
-        bet = None
-        if edge > 0.06:
-            bet = "HOME ML"
-        elif edge < -0.06:
-            bet = "AWAY ML"
-
-        results.append({
-            "Game": f'{g["away"]} @ {g["home"]}',
-            "Win Prob %": round(prob * 100, 1),
-            "Edge %": round(edge * 100, 1),
-            "Odds": odds,
-            "Bet": bet
-        })
-
-    df = pd.DataFrame(results)
-
-    print("\n📊 ALL GAMES")
-    print(df)
-
-    value = df[df["Edge %"].abs() > 6]
-
-    print("\n🔥 VALUE BETS")
-    print(value)
-
-    return df
-
-# ==============================
+# =========================
 # RUN
-# ==============================
+# =========================
 
-if __name__ == "__main__":
-    run()
+st.write("Loading MLB games...")
+
+games = get_games()
+
+st.write(f"Games found: {len(games)}")
+
+if len(games) == 0:
+    st.warning("No games found or API issue.")
+    st.stop()
+
+odds_map = get_odds()
+
+results = []
+
+for g in games:
+
+    home_stats = team_stats(g["home_id"])
+    away_stats = team_stats(g["away_id"])
+
+    home_pitch = pitcher_stats(g["home_pitcher"])
+    away_pitch = pitcher_stats(g["away_pitcher"])
+
+    odds = odds_map.get(g["home"], 1.90)
+
+    prob, edge = predict(
+        g["home"], g["away"],
+        home_pitch, away_pitch,
+        home_stats, away_stats,
+        odds
+    )
+
+    bet = None
+    if edge > 0.05:
+        bet = "HOME ML"
+    elif edge < -0.05:
+        bet = "AWAY ML"
+
+    results.append({
+        "Game": f'{g["away"]} @ {g["home"]}',
+        "Win Prob %": round(prob * 100, 1),
+        "Edge %": round(edge * 100, 1),
+        "Odds": odds,
+        "Bet": bet
+    })
+
+df = pd.DataFrame(results)
+
+st.subheader("📊 Full Model Predictions")
+st.dataframe(df, use_container_width=True)
+
+st.subheader("🔥 Value Bets")
+st.dataframe(df[df["Edge %"].abs() > 5])
